@@ -114,8 +114,8 @@ def login_screen():
 
     st.markdown("""
         <div style='text-align:center; margin-top:2rem; color:#aaa; font-size:0.8rem;'>
-            Default credentials — admin / admin123 &nbsp;|&nbsp; vevor / vevor2026<br>
-            Change passwords in the Admin panel after first login.
+            
+            
         </div>
     """, unsafe_allow_html=True)
 
