@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+reportlab
+gspread
+google-auth
