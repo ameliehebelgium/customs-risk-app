@@ -901,6 +901,18 @@ def main():
                                                     <td style="font-weight:600; padding:3px 0;">
                                                     {row.get("Previous Container","—")}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">BL Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">
+                                                    {row.get("BL Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">Job Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">
+                                                    {row.get("Job Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">SKU</td>
+                                                    <td style="font-weight:600; padding:3px 0;">
+                                                    {row.get("SKU Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
                                                     white-space:nowrap;">MRN</td>
                                                     <td style="font-weight:600; padding:3px 0;">
                                                     {row.get("Previous MRN","—")}</td></tr>
