@@ -441,9 +441,6 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
-                "Job Number":                risk_row.get("Job Number", ""),
-                "BL Number":                 risk_row.get("BL Number", ""),
-                "SKU Number":                risk_row.get("SKU Number", ""),
                 "Historical Product":        risk_row["Product Name"],
                 "Old HS Used Before":        old_hs,
                 "Duty Before":               risk_row["Duty Before"],
@@ -833,6 +830,7 @@ def main():
                         display_cols = [
                             "Current Container", "Severity", "Action Required",
                             "Current Product", "Current HS", "Corrected HS",
+                            "Job Number", "BL Number", "SKU Number",
                             "Matched Risk ID", "Previous Inspection Date",
                             "Previous Container", "Previous MRN", "Message"
                         ]
@@ -849,8 +847,7 @@ def main():
                         st.dataframe(
                             check_df[[
                                 "Matched Risk ID", "Previous Inspection Date", "Previous Container",
-                                "Previous MRN", "Job Number", "BL Number", "SKU Number",
-                                "Historical Product", "Old HS Used Before",
+                                "Previous MRN", "Historical Product", "Old HS Used Before",
                                 "Corrected HS", "Duty Before", "Duty After",
                                 "Customs Comment", "Risk Reason"
                             ]].drop_duplicates(),
