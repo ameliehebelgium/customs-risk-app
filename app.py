@@ -441,6 +441,9 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
+                "Job Number":                risk_row.get("Job Number", ""),
+                "BL Number":                 risk_row.get("BL Number", ""),
+                "SKU Number":                risk_row.get("SKU Number", ""),
                 "Historical Product":        risk_row["Product Name"],
                 "Old HS Used Before":        old_hs,
                 "Duty Before":               risk_row["Duty Before"],
@@ -889,36 +892,95 @@ def main():
                         st.error(f"🚨 RED ALERT: {len(red_df)} high-risk line(s) detected.")
                         st.warning(f"⚠️ ORANGE WARNING: {len(orange_df)} line(s) require manual review.")
 
-                        # Ensure Current Container is never blank in display
+                        # Ensure Current Container is never blank
                         check_df["Current Container"] = check_df["Current Container"].apply(
                             lambda x: x if clean_text(x) not in ("", "None") else "⚠️ Not detected"
                         )
-
-                        display_cols = [
-                            "Current Container", "Severity", "Action Required",
-                            "Current Product", "Current HS", "Corrected HS",
-                            "Matched Risk ID", "Previous Inspection Date",
-                            "Previous Container", "Previous MRN", "Message"
-                        ]
                         red_df    = check_df[check_df["Severity"] == "RED"]
                         orange_df = check_df[check_df["Severity"] == "ORANGE"]
+
+                        def render_cards(df, color):
+                            border = "#c0392b" if color == "red" else "#d35400"
+                            bg     = "#fff5f5" if color == "red" else "#fff8f0"
+                            icon   = "🚨" if color == "red" else "⚠️"
+                            for _, row in df.iterrows():
+                                st.markdown(f"""
+                                <div style="border:2px solid {border}; border-radius:10px;
+                                            background:{bg}; padding:16px; margin-bottom:16px;">
+                                    <div style="font-weight:700; font-size:1.05rem;
+                                                color:{border}; margin-bottom:12px;">
+                                        {icon} {row.get("Action Required","")} &nbsp;|&nbsp;
+                                        {row.get("Message","")}
+                                    </div>
+                                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                                        <div style="background:white; border-radius:8px;
+                                                    padding:12px; border:1px solid #ddd;">
+                                            <div style="font-weight:700; color:#1a3c6e;
+                                                        margin-bottom:8px; font-size:0.9rem;">
+                                                📦 CURRENT SHIPMENT
+                                            </div>
+                                            <table style="width:100%; font-size:0.85rem; border-collapse:collapse;">
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">　</td>
+                                                    <td style="padding:3px 0;">　</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Container</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Current Container","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">BL Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("BL Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Job Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Job Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">SKU</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("SKU Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">MRN</td>
+                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Inspection</td>
+                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Product</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Current Product","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Current HS</td>
+                                                    <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Current HS","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Should be</td>
+                                                    <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
+                                            </table>
+                                        </div>
+                                        <div style="background:white; border-radius:8px;
+                                                    padding:12px; border:1px solid #ddd;">
+                                            <div style="font-weight:700; color:#555;
+                                                        margin-bottom:8px; font-size:0.9rem;">
+                                                📋 HISTORICAL REFERENCE
+                                            </div>
+                                            <table style="width:100%; font-size:0.85rem; border-collapse:collapse;">
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Risk ID</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Matched Risk ID","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Container</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous Container","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">BL Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("BL Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Job Number</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Job Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">SKU</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("SKU Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">MRN</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous MRN","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Inspection</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous Inspection Date","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Product</td>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Historical Product","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Old HS</td>
+                                                    <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Old HS Used Before","—")}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Corrected to</td>
+                                                    <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
                         if len(red_df) > 0:
                             st.markdown("#### 🚨 Action Required — High Risk Lines")
-                            st.dataframe(red_df[display_cols], use_container_width=True)
+                            render_cards(red_df, "red")
                         if len(orange_df) > 0:
                             st.markdown("#### ⚠️ Manual Review Required")
-                            st.dataframe(orange_df[display_cols], use_container_width=True)
-
-                        st.markdown("#### Matched Historical Customs Records")
-                        st.dataframe(
-                            check_df[[
-                                "Matched Risk ID", "Previous Inspection Date", "Previous Container",
-                                "Previous MRN", "Historical Product", "Old HS Used Before",
-                                "Corrected HS", "Duty Before", "Duty After",
-                                "Customs Comment", "Risk Reason"
-                            ]].drop_duplicates(),
-                            use_container_width=True
-                        )
+                            render_cards(orange_df, "orange")
 
                         # PDF export
                         st.markdown("---")
@@ -931,7 +993,8 @@ def main():
                             data=pdf_bytes,
                             file_name=report_name,
                             mime="application/pdf",
-                            type="primary"
+                            type="primary",
+                            use_container_width=False,
                         )
 
     # ────────────────────────────────────────────────────────────────────────
