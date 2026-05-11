@@ -853,6 +853,9 @@ def main():
                                             <table style="width:100%; font-size:0.85rem;
                                                           border-collapse:collapse;">
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">　</td>
+                                                    <td style="padding:3px 0;">　</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
                                                     white-space:nowrap;">Container</td>
                                                     <td style="font-weight:600; padding:3px 0;">
                                                     {row.get("Current Container","—")}</td></tr>
@@ -868,6 +871,12 @@ def main():
                                                     white-space:nowrap;">SKU</td>
                                                     <td style="font-weight:600; padding:3px 0;">
                                                     {row.get("SKU Number","—") or "—"}</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">MRN</td>
+                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
+                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
+                                                    white-space:nowrap;">Inspection</td>
+                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0;
                                                     white-space:nowrap;">Product</td>
                                                     <td style="font-weight:600; padding:3px 0;">
