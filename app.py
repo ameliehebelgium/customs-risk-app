@@ -44,7 +44,7 @@ LOGO_FILE  = Path("vevor_logo.png")
 # ─── Column definitions ───────────────────────────────────────────────────────
 COLUMNS = [
     "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
-    "BL Number", "Job Number", "Inspector", "SKU Number",
+    "BL Number", "Job Number", "Inspector",
     "Product Name", "Product Alias", "Declaration Description",
     "Old HS", "Corrected HS", "Duty Before", "Duty After",
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
@@ -252,8 +252,6 @@ def normalize_import_file(uploaded_file):
         "Job Number": "Job Number",
         "Inspector (Customs Agent)": "Inspector",
         "Inspector": "Inspector",
-        "SKU number": "SKU Number",
-        "SKU Number": "SKU Number",
         "Product Name (EN)": "Product Name",
         "Declaration Description (as filed)": "Declaration Description",
         "OLD HS Code (as declared)": "Old HS",
@@ -443,6 +441,9 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
+                "Job Number":                risk_row.get("Job Number", ""),
+                "BL Number":                 risk_row.get("BL Number", ""),
+                "SKU Number":                risk_row.get("SKU Number", ""),
                 "Historical Product":        risk_row["Product Name"],
                 "Old HS Used Before":        old_hs,
                 "Duty Before":               risk_row["Duty Before"],
@@ -848,7 +849,8 @@ def main():
                         st.dataframe(
                             check_df[[
                                 "Matched Risk ID", "Previous Inspection Date", "Previous Container",
-                                "Previous MRN", "Historical Product", "Old HS Used Before",
+                                "Previous MRN", "Job Number", "BL Number", "SKU Number",
+                                "Historical Product", "Old HS Used Before",
                                 "Corrected HS", "Duty Before", "Duty After",
                                 "Customs Comment", "Risk Reason"
                             ]].drop_duplicates(),
@@ -924,11 +926,10 @@ def main():
                 container_no = st.text_input("Container No")
                 mrn          = st.text_input("MRN")
 
-                col_bl = st.columns(4)
+                col_bl = st.columns(3)
                 with col_bl[0]: bl_number  = st.text_input("BL Number")
                 with col_bl[1]: job_number = st.text_input("Job Number")
                 with col_bl[2]: inspector  = st.text_input("Inspector")
-                with col_bl[3]: sku_number = st.text_input("SKU Number")
 
                 product_name = st.text_input("Product Name *")
                 product_alias     = st.text_input("Product Alias / Possible Descriptions")
@@ -965,7 +966,6 @@ def main():
                             "BL Number":               bl_number,
                             "Job Number":              job_number,
                             "Inspector":               inspector,
-                            "SKU Number":              sku_number,
                             "Product Name":            product_name,
                             "Product Alias":           product_alias,
                             "Declaration Description": declaration_desc,
