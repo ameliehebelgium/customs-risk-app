@@ -44,6 +44,7 @@ LOGO_FILE  = Path("vevor_logo.png")
 # ─── Column definitions ───────────────────────────────────────────────────────
 COLUMNS = [
     "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
+    "BL Number", "Job Number", "Inspector",
     "Product Name", "Product Alias", "Declaration Description",
     "Old HS", "Corrected HS", "Duty Before", "Duty After",
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
@@ -245,6 +246,12 @@ def normalize_import_file(uploaded_file):
         "Inspection Date": "Inspection Date",
         "Container No.": "Container No",
         "MRN (Declaration Ref)": "MRN",
+        "BL number": "BL Number",
+        "BL Number": "BL Number",
+        "Job number": "Job Number",
+        "Job Number": "Job Number",
+        "Inspector (Customs Agent)": "Inspector",
+        "Inspector": "Inspector",
         "Product Name (EN)": "Product Name",
         "Declaration Description (as filed)": "Declaration Description",
         "OLD HS Code (as declared)": "Old HS",
@@ -914,6 +921,12 @@ def main():
 
                 container_no = st.text_input("Container No")
                 mrn          = st.text_input("MRN")
+
+                col_bl = st.columns(3)
+                with col_bl[0]: bl_number  = st.text_input("BL Number")
+                with col_bl[1]: job_number = st.text_input("Job Number")
+                with col_bl[2]: inspector  = st.text_input("Inspector")
+
                 product_name = st.text_input("Product Name *")
                 product_alias     = st.text_input("Product Alias / Possible Descriptions")
                 declaration_desc  = st.text_input("Declaration Description")
@@ -946,6 +959,9 @@ def main():
                             "Inspection Date":         str(inspection_date) if inspection_date else "",
                             "Container No":            container_no,
                             "MRN":                     mrn,
+                            "BL Number":               bl_number,
+                            "Job Number":              job_number,
+                            "Inspector":               inspector,
                             "Product Name":            product_name,
                             "Product Alias":           product_alias,
                             "Declaration Description": declaration_desc,
