@@ -509,40 +509,107 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
     story.append(summary_table)
     story.append(Spacer(1, 0.5*cm))
 
-    # Detail columns
-    display_cols = [
-        "Severity", "Action Required", "Current Container",
-        "Current Product", "Current HS", "Corrected HS",
-        "Matched Risk ID", "Previous Inspection Date", "Previous Container", "Message"
-    ]
-    col_widths = [1.8*cm, 2.8*cm, 3.2*cm, 4.5*cm, 2.2*cm, 2.2*cm, 2.8*cm, 2.6*cm, 2.8*cm, 4.5*cm]
+    label_style  = ParagraphStyle("label", parent=styles["Normal"],
+                                  fontSize=7.5, textColor=colors.HexColor("#666666"))
+    value_style  = ParagraphStyle("value", parent=styles["Normal"],
+                                  fontSize=7.5, fontName="Helvetica-Bold")
+    red_val      = ParagraphStyle("redval", parent=styles["Normal"],
+                                  fontSize=7.5, fontName="Helvetica-Bold",
+                                  textColor=colors.HexColor("#c0392b"))
+    green_val    = ParagraphStyle("greenval", parent=styles["Normal"],
+                                  fontSize=7.5, fontName="Helvetica-Bold",
+                                  textColor=colors.HexColor("#1a6e3c"))
+    section_style= ParagraphStyle("sect", parent=styles["Normal"],
+                                  fontSize=8, fontName="Helvetica-Bold",
+                                  textColor=colors.HexColor("#1a3c6e"))
 
-    def make_section(section_df, heading, bg_header, bg_row):
+    def v(row, key, style=None):
+        val = str(row.get(key, "") or "—")
+        if not val or val in ("", "None", "nan"):
+            val = "—"
+        return Paragraph(val, style or value_style)
+
+    def make_card_section(section_df, heading, border_color, bg_color):
         if len(section_df) == 0:
             return
         story.append(Paragraph(heading, h2_style))
-        header_row = [Paragraph(f"<b>{c}</b>", cell_style) for c in display_cols]
-        rows = [header_row]
-        for _, row in section_df.iterrows():
-            rows.append([Paragraph(str(row.get(c, "")), cell_style) for c in display_cols])
-        t = Table(rows, colWidths=col_widths, repeatRows=1)
-        t.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, 0), bg_header),
-            ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
-            ("ROWBACKGROUNDS",(0, 1), (-1,-1), [colors.white, bg_row]),
-            ("BOX",           (0, 0), (-1,-1), 0.4, colors.HexColor("#bbbbbb")),
-            ("INNERGRID",     (0, 0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
-            ("VALIGN",        (0, 0), (-1,-1), "TOP"),
-            ("TOPPADDING",    (0, 0), (-1,-1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1,-1), 4),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 0.3*cm))
+        story.append(Spacer(1, 0.2*cm))
 
-    make_section(red_df,    "🚨 HIGH RISK — Immediate Action Required",
-                 colors.HexColor("#c0392b"), colors.HexColor("#fdf0f0"))
-    make_section(orange_df, "⚠️  MANUAL REVIEW REQUIRED",
-                 colors.HexColor("#d35400"), colors.HexColor("#fdf6ec"))
+        for _, row in section_df.iterrows():
+            # Alert banner
+            alert_msg = f"<b>{row.get('Action Required','')} | {row.get('Message','')}</b>"
+            banner = Table([[Paragraph(alert_msg, ParagraphStyle(
+                "banner", parent=styles["Normal"], fontSize=8,
+                textColor=border_color))]],
+                colWidths=[25*cm])
+            banner.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), bg_color),
+                ("TOPPADDING", (0,0), (-1,-1), 6),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+                ("LEFTPADDING", (0,0), (-1,-1), 8),
+            ]))
+            story.append(banner)
+
+            # Two-column card
+            rows_left  = [
+                [Paragraph("📦 CURRENT SHIPMENT", section_style), ""],
+                [Paragraph("Container",  label_style), v(row, "Current Container")],
+                [Paragraph("BL Number",  label_style), v(row, "BL Number")],
+                [Paragraph("Job Number", label_style), v(row, "Job Number")],
+                [Paragraph("SKU",        label_style), v(row, "SKU Number")],
+                [Paragraph("MRN",        label_style), Paragraph("—", label_style)],
+                [Paragraph("Inspection", label_style), Paragraph("—", label_style)],
+                [Paragraph("Product",    label_style), v(row, "Current Product")],
+                [Paragraph("Current HS", label_style), v(row, "Current HS", red_val)],
+                [Paragraph("✅ Should be",label_style), v(row, "Corrected HS", green_val)],
+            ]
+            rows_right = [
+                [Paragraph("📋 HISTORICAL REFERENCE", section_style), ""],
+                [Paragraph("Container",  label_style), v(row, "Previous Container")],
+                [Paragraph("BL Number",  label_style), v(row, "BL Number")],
+                [Paragraph("Job Number", label_style), v(row, "Job Number")],
+                [Paragraph("SKU",        label_style), v(row, "SKU Number")],
+                [Paragraph("MRN",        label_style), v(row, "Previous MRN")],
+                [Paragraph("Inspection", label_style), v(row, "Previous Inspection Date")],
+                [Paragraph("Product",    label_style), v(row, "Historical Product")],
+                [Paragraph("Old HS",     label_style), v(row, "Old HS Used Before", red_val)],
+                [Paragraph("✅ Corrected to", label_style), v(row, "Corrected HS", green_val)],
+            ]
+
+            def make_inner(rows_data):
+                t = Table(rows_data, colWidths=[3*cm, 9*cm])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#f0f4fa")),
+                    ("SPAN",          (0,0), (-1,0)),
+                    ("TOPPADDING",    (0,0), (-1,-1), 4),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                    ("LEFTPADDING",   (0,0), (-1,-1), 6),
+                    ("RIGHTPADDING",  (0,0), (-1,-1), 6),
+                    ("INNERGRID",     (0,1), (-1,-1), 0.3, colors.HexColor("#eeeeee")),
+                    ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+                    ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+                ]))
+                return t
+
+            card = Table(
+                [[make_inner(rows_left), make_inner(rows_right)]],
+                colWidths=[12.5*cm, 12.5*cm]
+            )
+            card.setStyle(TableStyle([
+                ("LEFTPADDING",   (0,0), (-1,-1), 0),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+                ("TOPPADDING",    (0,0), (-1,-1), 0),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+                ("INNERGRID",     (0,0), (-1,-1), 4, colors.white),
+                ("BOX",           (0,0), (-1,-1), 1.5, border_color),
+            ]))
+            story.append(card)
+            story.append(Spacer(1, 0.4*cm))
+
+    make_card_section(red_df,    "🚨 HIGH RISK — Immediate Action Required",
+                      colors.HexColor("#c0392b"), colors.HexColor("#fdf0f0"))
+    make_card_section(orange_df, "⚠️  MANUAL REVIEW REQUIRED",
+                      colors.HexColor("#d35400"), colors.HexColor("#fdf6ec"))
 
     story.append(Spacer(1, 0.5*cm))
     story.append(Paragraph(
@@ -822,140 +889,36 @@ def main():
                         st.error(f"🚨 RED ALERT: {len(red_df)} high-risk line(s) detected.")
                         st.warning(f"⚠️ ORANGE WARNING: {len(orange_df)} line(s) require manual review.")
 
-                        # Ensure Current Container is never blank
+                        # Ensure Current Container is never blank in display
                         check_df["Current Container"] = check_df["Current Container"].apply(
                             lambda x: x if clean_text(x) not in ("", "None") else "⚠️ Not detected"
                         )
+
+                        display_cols = [
+                            "Current Container", "Severity", "Action Required",
+                            "Current Product", "Current HS", "Corrected HS",
+                            "Matched Risk ID", "Previous Inspection Date",
+                            "Previous Container", "Previous MRN", "Message"
+                        ]
                         red_df    = check_df[check_df["Severity"] == "RED"]
                         orange_df = check_df[check_df["Severity"] == "ORANGE"]
-
-                        def render_cards(df, color):
-                            """Render risk cards with current shipment vs historical side by side."""
-                            border = "#c0392b" if color == "red" else "#d35400"
-                            bg     = "#fff5f5" if color == "red" else "#fff8f0"
-                            icon   = "🚨" if color == "red" else "⚠️"
-                            for i, (_, row) in enumerate(df.iterrows()):
-                                st.markdown(f"""
-                                <div style="border:2px solid {border}; border-radius:10px;
-                                            background:{bg}; padding:16px; margin-bottom:16px;">
-                                    <div style="font-weight:700; font-size:1.05rem;
-                                                color:{border}; margin-bottom:12px;">
-                                        {icon} {row.get("Action Required","")} &nbsp;|&nbsp;
-                                        {row.get("Message","")}
-                                    </div>
-                                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-                                        <div style="background:white; border-radius:8px;
-                                                    padding:12px; border:1px solid #ddd;">
-                                            <div style="font-weight:700; color:#1a3c6e;
-                                                        margin-bottom:8px; font-size:0.9rem;">
-                                                📦 CURRENT SHIPMENT
-                                            </div>
-                                            <table style="width:100%; font-size:0.85rem;
-                                                          border-collapse:collapse;">
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">　</td>
-                                                    <td style="padding:3px 0;">　</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Container</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Current Container","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">BL Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("BL Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Job Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Job Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">SKU</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("SKU Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">MRN</td>
-                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Inspection</td>
-                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Product</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Current Product","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Current HS</td>
-                                                    <td style="font-weight:600; color:{border};
-                                                    padding:3px 0;">
-                                                    {row.get("Current HS","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">✅ Should be</td>
-                                                    <td style="font-weight:700; color:#1a6e3c;
-                                                    padding:3px 0;">
-                                                    {row.get("Corrected HS","—")}</td></tr>
-                                            </table>
-                                        </div>
-                                        <div style="background:white; border-radius:8px;
-                                                    padding:12px; border:1px solid #ddd;">
-                                            <div style="font-weight:700; color:#555;
-                                                        margin-bottom:8px; font-size:0.9rem;">
-                                                📋 HISTORICAL REFERENCE
-                                            </div>
-                                            <table style="width:100%; font-size:0.85rem;
-                                                          border-collapse:collapse;">
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Risk ID</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Matched Risk ID","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Container</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Previous Container","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">BL Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("BL Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Job Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Job Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">SKU</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("SKU Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">MRN</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Previous MRN","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Inspection</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Previous Inspection Date","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Product</td>
-                                                    <td style="font-weight:600; padding:3px 0;">
-                                                    {row.get("Historical Product","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">Old HS</td>
-                                                    <td style="font-weight:600; color:{border};
-                                                    padding:3px 0;">
-                                                    {row.get("Old HS Used Before","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0;
-                                                    white-space:nowrap;">✅ Corrected to</td>
-                                                    <td style="font-weight:700; color:#1a6e3c;
-                                                    padding:3px 0;">
-                                                    {row.get("Corrected HS","—")}</td></tr>
-                                            </table>
-                                        </div>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
                         if len(red_df) > 0:
                             st.markdown("#### 🚨 Action Required — High Risk Lines")
-                            render_cards(red_df, "red")
-
+                            st.dataframe(red_df[display_cols], use_container_width=True)
                         if len(orange_df) > 0:
                             st.markdown("#### ⚠️ Manual Review Required")
-                            render_cards(orange_df, "orange")
+                            st.dataframe(orange_df[display_cols], use_container_width=True)
+
+                        st.markdown("#### Matched Historical Customs Records")
+                        st.dataframe(
+                            check_df[[
+                                "Matched Risk ID", "Previous Inspection Date", "Previous Container",
+                                "Previous MRN", "Historical Product", "Old HS Used Before",
+                                "Corrected HS", "Duty Before", "Duty After",
+                                "Customs Comment", "Risk Reason"
+                            ]].drop_duplicates(),
+                            use_container_width=True
+                        )
 
                         # PDF export
                         st.markdown("---")
@@ -968,8 +931,7 @@ def main():
                             data=pdf_bytes,
                             file_name=report_name,
                             mime="application/pdf",
-                            type="primary",
-                            use_container_width=False,
+                            type="primary"
                         )
 
     # ────────────────────────────────────────────────────────────────────────
