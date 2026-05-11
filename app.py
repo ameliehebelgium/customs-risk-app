@@ -441,9 +441,6 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
-                "Job Number":                risk_row.get("Job Number", ""),
-                "BL Number":                 risk_row.get("BL Number", ""),
-                "SKU Number":                risk_row.get("SKU Number", ""),
                 "Historical Product":        risk_row["Product Name"],
                 "Old HS Used Before":        old_hs,
                 "Duty Before":               risk_row["Duty Before"],
@@ -516,9 +513,11 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
     display_cols = [
         "Severity", "Action Required", "Current Container",
         "Current Product", "Current HS", "Corrected HS",
+        "Job Number", "BL Number", "SKU Number",
         "Matched Risk ID", "Previous Inspection Date", "Previous Container", "Message"
     ]
-    col_widths = [1.8*cm, 2.8*cm, 3.2*cm, 4.5*cm, 2.2*cm, 2.2*cm, 2.8*cm, 2.6*cm, 2.8*cm, 4.5*cm]
+    col_widths = [1.6*cm, 2.5*cm, 2.8*cm, 4*cm, 2*cm, 2*cm,
+                  2.2*cm, 2.2*cm, 2.2*cm, 2.5*cm, 2.3*cm, 2.5*cm, 3.8*cm]
 
     def make_section(section_df, heading, bg_header, bg_row):
         if len(section_df) == 0:
@@ -833,7 +832,6 @@ def main():
                         display_cols = [
                             "Current Container", "Severity", "Action Required",
                             "Current Product", "Current HS", "Corrected HS",
-                            "Job Number", "BL Number", "SKU Number",
                             "Matched Risk ID", "Previous Inspection Date",
                             "Previous Container", "Previous MRN", "Message"
                         ]
@@ -868,7 +866,8 @@ def main():
                             data=pdf_bytes,
                             file_name=report_name,
                             mime="application/pdf",
-                            type="primary"
+                            type="primary",
+                            use_container_width=False,
                         )
 
     # ────────────────────────────────────────────────────────────────────────
