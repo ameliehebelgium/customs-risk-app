@@ -1049,16 +1049,17 @@ def main():
                 with col2: cc_date         = st.date_input("CC Date", value=None)
                 with col3: inspection_date = st.date_input("Inspection Date", value=None)
 
-                container_no = st.text_input("Container No")
+                col_r1 = st.columns(2)
+                with col_r1[0]: job_number   = st.text_input("Job Number")
+                with col_r1[1]: sku_number   = st.text_input("SKU Number")
 
-                col_mrn = st.columns(2)
-                with col_mrn[0]: mrn        = st.text_input("MRN")
-                with col_mrn[1]: sku_number = st.text_input("SKU Number")
+                col_r2 = st.columns(2)
+                with col_r2[0]: container_no = st.text_input("Container No")
+                with col_r2[1]: bl_number    = st.text_input("BL Number")
 
-                col_bl = st.columns(3)
-                with col_bl[0]: bl_number  = st.text_input("BL Number")
-                with col_bl[1]: job_number = st.text_input("Job Number")
-                with col_bl[2]: inspector  = st.text_input("Inspector")
+                col_r3 = st.columns(2)
+                with col_r3[0]: mrn          = st.text_input("MRN")
+                with col_r3[1]: inspector    = st.text_input("Inspector")
 
                 product_name = st.text_input("Product Name *")
                 product_alias     = st.text_input("Product Alias / Possible Descriptions")
