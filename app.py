@@ -1052,10 +1052,11 @@ def main():
                 container_no = st.text_input("Container No")
                 mrn          = st.text_input("MRN")
 
-                col_bl = st.columns(3)
+                col_bl = st.columns(4)
                 with col_bl[0]: bl_number  = st.text_input("BL Number")
                 with col_bl[1]: job_number = st.text_input("Job Number")
                 with col_bl[2]: inspector  = st.text_input("Inspector")
+                with col_bl[3]: sku_number = st.text_input("SKU Number")
 
                 product_name = st.text_input("Product Name *")
                 product_alias     = st.text_input("Product Alias / Possible Descriptions")
@@ -1092,6 +1093,7 @@ def main():
                             "BL Number":               bl_number,
                             "Job Number":              job_number,
                             "Inspector":               inspector,
+                            "SKU Number":              sku_number,
                             "Product Name":            product_name,
                             "Product Alias":           product_alias,
                             "Declaration Description": declaration_desc,
