@@ -219,13 +219,31 @@ def generate_risk_id(df):
 
 
 def make_duplicate_key(row):
-    return (
-        clean_text(row.get("Container No", "")).upper(),
-        clean_text(row.get("MRN", "")).upper(),
-        clean_text(row.get("Product Name", "")).upper(),
-        clean_hs(row.get("Old HS", "")),
-        clean_hs(row.get("Corrected HS", "")),
-    )
+    """
+    A record is a duplicate only if ALL of these match:
+    SKU Number + Product Name + Old HS + Corrected HS
+    This allows the same SKU to have multiple records if
+    the product name or HS codes differ (e.g. reclassified differently).
+    If SKU is empty, fall back to Container No + MRN + Product Name.
+    """
+    sku = clean_text(row.get("SKU Number", "")).upper()
+    if sku:
+        return (
+            "SKU",
+            sku,
+            clean_text(row.get("Product Name", "")).upper(),
+            clean_hs(row.get("Old HS", "")),
+            clean_hs(row.get("Corrected HS", "")),
+        )
+    else:
+        return (
+            "NO_SKU",
+            clean_text(row.get("Container No", "")).upper(),
+            clean_text(row.get("MRN", "")).upper(),
+            clean_text(row.get("Product Name", "")).upper(),
+            clean_hs(row.get("Old HS", "")),
+            clean_hs(row.get("Corrected HS", "")),
+        )
 
 
 def find_header_row(uploaded_file):
@@ -412,9 +430,10 @@ def check_documents_against_risks(doc_df, risk_df):
     for _, doc_row in doc_df.iterrows():
         product = clean_text(doc_row["Product Description"])
         hs      = clean_hs(doc_row["HS Code"])
+        doc_sku = clean_text(doc_row.get("SKU Number", "")) if "SKU Number" in doc_row.index else ""
         for _, risk_row in risk_df.iterrows():
             old_hs        = clean_hs(risk_row["Old HS"])
-            product_match = product_matches_risk(product, risk_row)
+            product_match = product_matches_risk(product, risk_row, doc_sku)
             hs_match      = (hs == old_hs and old_hs != "")
             if product_match and hs_match:
                 severity = "RED"
@@ -1136,15 +1155,15 @@ def main():
             with fc2:
                 filter_hs = st.text_input("Filter by Old HS (exact)")
             with fc3:
-                filter_product = st.text_input("Filter by Product Name (contains)")
+                filter_sku = st.text_input("Filter by SKU (contains)")
 
             filtered = current_df.copy()
             if filter_status != "All":
                 filtered = filtered[filtered["Status"] == filter_status]
             if filter_hs:
                 filtered = filtered[filtered["Old HS"] == filter_hs.strip()]
-            if filter_product:
-                filtered = filtered[filtered["Product Name"].str.contains(filter_product.strip(), case=False, na=False)]
+            if filter_sku:
+                filtered = filtered[filtered["SKU Number"].str.contains(filter_sku.strip(), case=False, na=False)]
 
             st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
 
@@ -1158,25 +1177,37 @@ def main():
                     hide_index=True,
                     column_config={"Delete": st.column_config.CheckboxColumn("Delete")}
                 )
-                if st.button("💾 Save Changes"):
-                    updated = edited[edited["Delete"] == False].copy().drop(columns=["Delete"])
-                    # Merge back: rows not in filter remain unchanged
-                    unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
-                    merged    = pd.concat([unchanged, updated], ignore_index=True)
-                    for col in COLUMNS:
-                        if col not in merged.columns:
-                            merged[col] = ""
-                    merged = merged[COLUMNS]
-                    for col in COLUMNS:
-                        merged[col] = merged[col].apply(clean_text)
-                    for col in ["Input Date", "CC Date", "Inspection Date"]:
-                        merged[col] = merged[col].apply(format_date)
-                    merged["Old HS"]       = merged["Old HS"].apply(clean_hs)
-                    merged["Corrected HS"] = merged["Corrected HS"].apply(clean_hs)
-                    merged["Duty Before"]  = merged["Duty Before"].apply(format_duty_rate)
-                    merged["Duty After"]   = merged["Duty After"].apply(format_duty_rate)
-                    save_database(merged)
-                    st.success("Changes saved successfully.")
+                btn1, btn2 = st.columns(2)
+                with btn1:
+                    if st.button("💾 Save Changes", use_container_width=True):
+                        updated = edited[edited["Delete"] == False].copy().drop(columns=["Delete"])
+                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
+                        merged    = pd.concat([unchanged, updated], ignore_index=True)
+                        for col in COLUMNS:
+                            if col not in merged.columns:
+                                merged[col] = ""
+                        merged = merged[COLUMNS]
+                        for col in COLUMNS:
+                            merged[col] = merged[col].apply(clean_text)
+                        for col in ["Input Date", "CC Date", "Inspection Date"]:
+                            merged[col] = merged[col].apply(format_date)
+                        merged["Old HS"]       = merged["Old HS"].apply(clean_hs)
+                        merged["Corrected HS"] = merged["Corrected HS"].apply(clean_hs)
+                        merged["Duty Before"]  = merged["Duty Before"].apply(format_duty_rate)
+                        merged["Duty After"]   = merged["Duty After"].apply(format_duty_rate)
+                        save_database(merged)
+                        st.success("Changes saved successfully.")
+                with btn2:
+                    if st.button(f"🗑️ Delete ALL {len(filtered)} filtered rows",
+                                 type="secondary", use_container_width=True):
+                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
+                        for col in COLUMNS:
+                            if col not in unchanged.columns:
+                                unchanged[col] = ""
+                        unchanged = unchanged[COLUMNS]
+                        save_database(unchanged)
+                        st.success(f"Deleted {len(filtered)} rows successfully.")
+                        st.rerun()
             else:
                 st.info("👁️ Visitor mode — read only.")
                 st.dataframe(filtered, use_container_width=True, hide_index=True)
