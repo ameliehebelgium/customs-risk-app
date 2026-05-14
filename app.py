@@ -52,6 +52,13 @@ COLUMNS = [
 ]
 DOC_COLUMNS = ["Source File", "Current Container", "Line No", "Product Description", "HS Code", "Qty"]
 
+DISPLAY_COLUMNS = [
+    "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
+    "Job Number", "SKU Number", "Product Name",
+    "Old HS", "Corrected HS", "Duty Before", "Duty After",
+    "Findings Type", "Status", "Inspector", "Notes",
+]
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # AUTH HELPERS
@@ -1136,20 +1143,21 @@ def main():
             with fc2:
                 filter_hs = st.text_input("Filter by Old HS (exact)")
             with fc3:
-                filter_product = st.text_input("Filter by Product Name (contains)")
+                filter_sku = st.text_input("Filter by SKU (contains)")
 
             filtered = current_df.copy()
             if filter_status != "All":
                 filtered = filtered[filtered["Status"] == filter_status]
             if filter_hs:
                 filtered = filtered[filtered["Old HS"] == filter_hs.strip()]
-            if filter_product:
-                filtered = filtered[filtered["Product Name"].str.contains(filter_product.strip(), case=False, na=False)]
+            if filter_sku:
+                filtered = filtered[filtered["SKU Number"].str.contains(filter_sku.strip(), case=False, na=False)]
 
             st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
 
             if is_broker:
-                editable = filtered.copy()
+                show_cols = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
+                editable = filtered[show_cols].copy()
                 editable.insert(0, "Delete", False)
                 edited = st.data_editor(
                     editable,
