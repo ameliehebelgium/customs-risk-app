@@ -1166,44 +1166,46 @@ def main():
                     hide_index=True,
                     column_config={"Delete": st.column_config.CheckboxColumn("Delete")}
                 )
-                if st.button("💾 Save Changes"):
-                    kept = edited[edited["Delete"] == False].drop(columns=["Delete"])
-                    full_updated = filtered.copy()
-                    for _, erow in kept.iterrows():
-                        rid = erow.get("Risk ID")
-                        mask = full_updated["Risk ID"] == rid
-                        for col in show_cols:
-                            if col in full_updated.columns:
-                                full_updated.loc[mask, col] = erow.get(col, "")
-                    full_updated = full_updated[full_updated["Risk ID"].isin(kept["Risk ID"].tolist())]
-                    unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
-                    merged    = pd.concat([unchanged, full_updated], ignore_index=True)
-                    for col in COLUMNS:
-                        if col not in merged.columns:
-                            merged[col] = ""
-                    merged = merged[COLUMNS]
-                    for col in COLUMNS:
-                        merged[col] = merged[col].apply(clean_text)
-                    for col in ["Input Date", "CC Date", "Inspection Date"]:
-                        merged[col] = merged[col].apply(format_date)
-                    merged["Old HS"]       = merged["Old HS"].apply(clean_hs)
-                    merged["Corrected HS"] = merged["Corrected HS"].apply(clean_hs)
-                    merged["Duty Before"]  = merged["Duty Before"].apply(format_duty_rate)
-                    merged["Duty After"]   = merged["Duty After"].apply(format_duty_rate)
-                    save_database(merged)
-                    st.success("Changes saved successfully.")
-                if st.button(f"🗑️ Delete ALL {len(filtered)} filtered rows", type="secondary"):
-                    unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
-                    save_database(unchanged)
-                    st.success(f"Deleted {len(filtered)} rows successfully.")
-                    st.rerun()
+                col_b1, col_b2 = st.columns(2)
+                with col_b1:
+                    if st.button("💾 Save Changes", use_container_width=True):
+                        kept = edited[edited["Delete"] == False].drop(columns=["Delete"])
+                        full_updated = filtered.copy()
+                        for _, erow in kept.iterrows():
+                            rid = erow.get("Risk ID")
+                            mask = full_updated["Risk ID"] == rid
+                            for col in show_cols:
+                                if col in full_updated.columns:
+                                    full_updated.loc[mask, col] = erow.get(col, "")
+                        full_updated = full_updated[full_updated["Risk ID"].isin(kept["Risk ID"].tolist())]
+                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
+                        merged    = pd.concat([unchanged, full_updated], ignore_index=True)
+                        for col in COLUMNS:
+                            if col not in merged.columns:
+                                merged[col] = ""
+                        merged = merged[COLUMNS]
+                        for col in COLUMNS:
+                            merged[col] = merged[col].apply(clean_text)
+                        for col in ["Input Date", "CC Date", "Inspection Date"]:
+                            merged[col] = merged[col].apply(format_date)
+                        merged["Old HS"]       = merged["Old HS"].apply(clean_hs)
+                        merged["Corrected HS"] = merged["Corrected HS"].apply(clean_hs)
+                        merged["Duty Before"]  = merged["Duty Before"].apply(format_duty_rate)
+                        merged["Duty After"]   = merged["Duty After"].apply(format_duty_rate)
+                        save_database(merged)
+                        st.success("Changes saved successfully.")
+                with col_b2:
+                    if st.button(f"🗑️ Delete ALL {len(filtered)} filtered rows", type="secondary", use_container_width=True):
+                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
+                        save_database(unchanged)
+                        st.success(f"Deleted {len(filtered)} rows.")
+                        st.rerun()
             else:
                 st.info("👁️ Visitor mode — read only.")
                 show_cols_v = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
                 st.dataframe(filtered[show_cols_v], use_container_width=True, hide_index=True)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # TAB 4 — Dashboard
+        # TAB 4 — Dashboard
     # ────────────────────────────────────────────────────────────────────────
     with tab_objects[3]:
         render_dashboard(load_database())
