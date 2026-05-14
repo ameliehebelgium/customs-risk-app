@@ -1228,3 +1228,4 @@ if not st.session_state["logged_in"]:
     login_screen()
 else:
     main()
+# force redeploy jeu. 14 mai 2026 22:51:51 CEST
