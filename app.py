@@ -50,7 +50,7 @@ COLUMNS = [
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
     "Status", "Notes",
 ]
-DOC_COLUMNS = ["Source File", "Current Container", "Line No", "Product Description", "HS Code", "Qty"]
+DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number", "Line No", "Product Description", "HS Code", "Qty"]
 
 DISPLAY_COLUMNS = [
     "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
