@@ -234,16 +234,15 @@ def generate_risk_id(df):
 
 def make_duplicate_key(row):
     """
-    Same SKU + same Product Name + same Old HS + same Corrected HS = duplicate.
-    If SKU is empty, fall back to Container No + MRN + Product Name + HS codes.
-    This allows same SKU with different HS corrections to be stored as separate records.
+    Duplicate = same SKU + same Old HS + same Corrected HS.
+    Product Name is NOT used — different SKUs with same product name are separate records.
+    If SKU is empty, fall back to Container No + MRN + Old HS + Corrected HS.
     """
     sku = clean_text(row.get("SKU Number", "")).upper()
     if sku:
         return (
             "SKU",
             sku,
-            clean_text(row.get("Product Name", "")).upper(),
             clean_hs(row.get("Old HS", "")),
             clean_hs(row.get("Corrected HS", "")),
         )
