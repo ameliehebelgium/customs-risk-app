@@ -59,6 +59,13 @@ DISPLAY_COLUMNS = [
     "Findings Type", "Status", "Inspector", "Notes",
 ]
 
+DISPLAY_COLUMNS = [
+    "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
+    "Job Number", "SKU Number", "Product Name",
+    "Old HS", "Corrected HS", "Duty Before", "Duty After",
+    "Findings Type", "Status", "Inspector", "Notes",
+]
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # AUTH HELPERS
@@ -226,13 +233,29 @@ def generate_risk_id(df):
 
 
 def make_duplicate_key(row):
-    return (
-        clean_text(row.get("Container No", "")).upper(),
-        clean_text(row.get("MRN", "")).upper(),
-        clean_text(row.get("Product Name", "")).upper(),
-        clean_hs(row.get("Old HS", "")),
-        clean_hs(row.get("Corrected HS", "")),
-    )
+    """
+    Same SKU + same Product Name + same Old HS + same Corrected HS = duplicate.
+    If SKU is empty, fall back to Container No + MRN + Product Name + HS codes.
+    This allows same SKU with different HS corrections to be stored as separate records.
+    """
+    sku = clean_text(row.get("SKU Number", "")).upper()
+    if sku:
+        return (
+            "SKU",
+            sku,
+            clean_text(row.get("Product Name", "")).upper(),
+            clean_hs(row.get("Old HS", "")),
+            clean_hs(row.get("Corrected HS", "")),
+        )
+    else:
+        return (
+            "NO_SKU",
+            clean_text(row.get("Container No", "")).upper(),
+            clean_text(row.get("MRN", "")).upper(),
+            clean_text(row.get("Product Name", "")).upper(),
+            clean_hs(row.get("Old HS", "")),
+            clean_hs(row.get("Corrected HS", "")),
+        )
 
 
 def find_header_row(uploaded_file):
