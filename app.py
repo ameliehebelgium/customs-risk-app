@@ -282,6 +282,8 @@ def normalize_import_file(uploaded_file):
         "Job Number": "Job Number",
         "Inspector (Customs Agent)": "Inspector",
         "Inspector": "Inspector",
+        "SKU number": "SKU Number",
+        "SKU Number": "SKU Number",
         "Product Name (EN)": "Product Name",
         "Declaration Description (as filed)": "Declaration Description",
         "OLD HS Code (as declared)": "Old HS",
