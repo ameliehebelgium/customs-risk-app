@@ -50,7 +50,7 @@ COLUMNS = [
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
     "Status", "Notes",
 ]
-DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number", "Line No", "Product Description", "HS Code", "Qty"]
+DOC_COLUMNS = ["Source File", "Current Container", "Line No", "Product Description", "HS Code", "Qty"]
 
 DISPLAY_COLUMNS = [
     "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
@@ -372,119 +372,77 @@ def extract_containers_from_header(raw_df) -> list:
     return containers
 
 
-def _is_vevor_shipment_format(df) -> bool:
-    """Detect the Vevor shipment format: job number, SKU, description, HS code, container number."""
-    if len(df.columns) < 4:
-        return False
-    cols = [str(c).strip().lower() for c in df.columns]
-    has_sku = any("sku" in c for c in cols)
-    has_job = any("job" in c for c in cols)
-    has_hs  = any("hs" in c for c in cols)
-    has_container = any("container" in c for c in cols)
-    return has_sku and has_job and has_hs
-
-
 def normalize_document_file(uploaded_file):
-    import re
+    import re as _re
     raw = pd.read_excel(uploaded_file, header=None, dtype=str)
 
-    # ── Detect Vevor shipment format (job number, SKU, description, HS code, container) ──
+    # ── Detect Vevor shipment format 1: job number, SKU, description, HS code, container ──
     first_row = [str(x).strip().lower() for x in raw.iloc[0].tolist()]
-    is_vevor_format = (
+    is_vevor_format1 = (
         any("sku" in c for c in first_row) and
         any("hs" in c for c in first_row) and
         any("job" in c for c in first_row)
     )
-    # ── Detect Vevor internal format (排柜单号, SKU, 英文申报名称, 中国出口HS) ──
-    is_vevor_internal = (
+    # ── Detect Vevor internal format 2: 排柜单号, SKU, 英文申报名称, 中国出口HS ──
+    is_vevor_format2 = (
         any("排柜单号" in c for c in first_row) and
         any("sku" in c for c in first_row) and
         any("英文申报名称" in c for c in first_row)
     )
 
-    if is_vevor_format:
+    if is_vevor_format1:
         df = pd.read_excel(uploaded_file, header=0, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
-
-        # Find columns
         job_col = sku_col = desc_col = hs_col = container_col = None
         for col in df.columns:
             col_l = col.lower()
-            if job_col is None and "job" in col_l:
-                job_col = col
-            if sku_col is None and "sku" in col_l:
-                sku_col = col
-            if desc_col is None and "description" in col_l:
-                desc_col = col
-            if hs_col is None and "hs" in col_l:
-                hs_col = col
-            if container_col is None and "container" in col_l:
-                container_col = col
-
+            if job_col is None and "job" in col_l: job_col = col
+            if sku_col is None and "sku" in col_l: sku_col = col
+            if desc_col is None and "description" in col_l: desc_col = col
+            if hs_col is None and "hs" in col_l: hs_col = col
+            if container_col is None and "container" in col_l: container_col = col
         if not desc_col or not hs_col:
             return pd.DataFrame(columns=DOC_COLUMNS)
-
+        def _extract_job(val):
+            val = clean_text(val)
+            m = _re.search(r"(\d{6})$", val)
+            return m.group(1) if m else val
         result = pd.DataFrame()
         result["Source File"]         = uploaded_file.name
         result["Line No"]             = range(1, len(df) + 1)
-        result["Product Description"] = df[desc_col].apply(clean_text) if desc_col else ""
-        result["HS Code"]             = df[hs_col].apply(clean_hs) if hs_col else ""
+        result["Product Description"] = df[desc_col].apply(clean_text)
+        result["HS Code"]             = df[hs_col].apply(clean_hs)
         result["Qty"]                 = ""
         result["SKU Number"]          = df[sku_col].apply(clean_text) if sku_col else ""
         result["Current Container"]   = df[container_col].apply(clean_text) if container_col else ""
-
-        # Extract job number (last 6 digits from job number string)
-        if job_col:
-            def extract_job_no(val):
-                val = clean_text(val)
-                m = re.search(r'(\d{6})$', val)
-                return m.group(1) if m else val
-            result["Job Number"] = df[job_col].apply(extract_job_no)
-        else:
-            result["Job Number"] = ""
-
-        result = result[
-            (result["Product Description"] != "") &
-            (result["HS Code"] != "")
-        ]
+        result["Job Number"]          = df[job_col].apply(_extract_job) if job_col else ""
+        result = result[(result["Product Description"] != "") & (result["HS Code"] != "")]
         return result[DOC_COLUMNS]
 
-    # ── Vevor internal logistics format (排柜单号, SKU, 英文申报名称, 中国出口HS, 箱号) ──
-    if is_vevor_internal:
-        import re as _re
-        cols = [str(c).strip() for c in raw.iloc[0].tolist()]
+    if is_vevor_format2:
         df = pd.read_excel(uploaded_file, header=0, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
-
         job_col  = next((c for c in df.columns if "排柜单号" in c), None)
         sku_col  = next((c for c in df.columns if c.upper() == "SKU"), None)
         desc_col = next((c for c in df.columns if "英文申报名称" in c), None)
         hs_col   = next((c for c in df.columns if "中国出口HS" in c or "出口HS" in c), None)
         con_col  = next((c for c in df.columns if "箱号" in c), None)
-
         if not desc_col or not hs_col:
             return pd.DataFrame(columns=DOC_COLUMNS)
-
-        def extract_job_no2(val):
+        def _extract_job2(val):
             val = clean_text(val)
-            m = _re.search(r'(\d{6})$', val)
+            m = _re.search(r"(\d{6})$", val)
             return m.group(1) if m else val
-
         result = pd.DataFrame()
         result["Source File"]         = uploaded_file.name
         result["Line No"]             = range(1, len(df) + 1)
-        result["Product Description"] = df[desc_col].apply(clean_text) if desc_col else ""
-        result["HS Code"]             = df[hs_col].apply(clean_hs) if hs_col else ""
+        result["Product Description"] = df[desc_col].apply(clean_text)
+        result["HS Code"]             = df[hs_col].apply(clean_hs)
         result["Qty"]                 = ""
         result["SKU Number"]          = df[sku_col].apply(clean_text) if sku_col else ""
         result["Current Container"]   = df[con_col].apply(clean_text) if con_col else ""
-        result["Job Number"]          = df[job_col].apply(extract_job_no2) if job_col else ""
-
-        result = result[
-            (result["Product Description"] != "") &
-            (result["HS Code"] != "") &
-            (result["HS Code"].str.len() >= 6)
-        ]
+        result["Job Number"]          = df[job_col].apply(_extract_job2) if job_col else ""
+        result = result[(result["Product Description"] != "") & (result["HS Code"] != "") & (result["HS Code"].str.len() >= 6)]
         return result[DOC_COLUMNS]
 
     # ── Standard invoice / packing list format ──
@@ -495,7 +453,7 @@ def normalize_document_file(uploaded_file):
     df = pd.read_excel(uploaded_file, header=header_row, dtype=str)
     df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
 
-    product_col = hs_col = qty_col = container_col = None
+    product_col = hs_col = qty_col = container_col = sku_col_pl = None
     for col in df.columns:
         col_upper = col.upper()
         if product_col is None and ("DESCRIPTION" in col_upper or "ITEM" in col_upper or "PRODUCT" in col_upper):
@@ -506,6 +464,8 @@ def normalize_document_file(uploaded_file):
             qty_col = col
         if container_col is None and ("柜号" in col or "CONTAINER" in col_upper):
             container_col = col
+        if sku_col_pl is None and "SKU" in col_upper:
+            sku_col_pl = col
 
     if product_col is None or hs_col is None:
         return pd.DataFrame(columns=DOC_COLUMNS)
@@ -516,7 +476,7 @@ def normalize_document_file(uploaded_file):
     result["Product Description"] = df[product_col].apply(clean_text)
     result["HS Code"]             = df[hs_col].apply(clean_hs)
     result["Qty"]                 = df[qty_col].apply(clean_text) if qty_col else ""
-    result["SKU Number"]          = ""
+    result["SKU Number"]          = df[sku_col_pl].apply(clean_text) if sku_col_pl else ""
     result["Job Number"]          = ""
 
     if container_col:
@@ -556,7 +516,6 @@ def check_documents_against_risks(doc_df, risk_df):
     for _, doc_row in doc_df.iterrows():
         product = clean_text(doc_row["Product Description"])
         hs      = clean_hs(doc_row["HS Code"])
-        doc_sku = clean_text(str(doc_row.get("SKU Number", "") or ""))
         for _, risk_row in risk_df.iterrows():
             old_hs        = clean_hs(risk_row["Old HS"])
             product_match = product_matches_risk(product, risk_row)
