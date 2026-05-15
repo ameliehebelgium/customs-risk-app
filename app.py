@@ -44,13 +44,13 @@ LOGO_FILE  = Path("vevor_logo.png")
 # ─── Column definitions ───────────────────────────────────────────────────────
 COLUMNS = [
     "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
-    "BL Number", "Job Number", "SKU Number", "Inspector",
+    "BL Number", "Job Number", "Inspector",
     "Product Name", "Product Alias", "Declaration Description",
     "Old HS", "Corrected HS", "Duty Before", "Duty After",
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
     "Status", "Notes",
 ]
-DOC_COLUMNS = ["Source File", "Current Container", "Line No", "Product Description", "HS Code", "Qty"]
+DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number", "Line No", "Product Description", "HS Code", "Qty"]
 
 DISPLAY_COLUMNS = [
     "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
@@ -372,10 +372,122 @@ def extract_containers_from_header(raw_df) -> list:
     return containers
 
 
+def _is_vevor_shipment_format(df) -> bool:
+    """Detect the Vevor shipment format: job number, SKU, description, HS code, container number."""
+    if len(df.columns) < 4:
+        return False
+    cols = [str(c).strip().lower() for c in df.columns]
+    has_sku = any("sku" in c for c in cols)
+    has_job = any("job" in c for c in cols)
+    has_hs  = any("hs" in c for c in cols)
+    has_container = any("container" in c for c in cols)
+    return has_sku and has_job and has_hs
+
+
 def normalize_document_file(uploaded_file):
+    import re
     raw = pd.read_excel(uploaded_file, header=None, dtype=str)
 
-    # Extract container numbers from file header
+    # ── Detect Vevor shipment format (job number, SKU, description, HS code, container) ──
+    first_row = [str(x).strip().lower() for x in raw.iloc[0].tolist()]
+    is_vevor_format = (
+        any("sku" in c for c in first_row) and
+        any("hs" in c for c in first_row) and
+        any("job" in c for c in first_row)
+    )
+    # ── Detect Vevor internal format (排柜单号, SKU, 英文申报名称, 中国出口HS) ──
+    is_vevor_internal = (
+        any("排柜单号" in c for c in first_row) and
+        any("sku" in c for c in first_row) and
+        any("英文申报名称" in c for c in first_row)
+    )
+
+    if is_vevor_format:
+        df = pd.read_excel(uploaded_file, header=0, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Find columns
+        job_col = sku_col = desc_col = hs_col = container_col = None
+        for col in df.columns:
+            col_l = col.lower()
+            if job_col is None and "job" in col_l:
+                job_col = col
+            if sku_col is None and "sku" in col_l:
+                sku_col = col
+            if desc_col is None and "description" in col_l:
+                desc_col = col
+            if hs_col is None and "hs" in col_l:
+                hs_col = col
+            if container_col is None and "container" in col_l:
+                container_col = col
+
+        if not desc_col or not hs_col:
+            return pd.DataFrame(columns=DOC_COLUMNS)
+
+        result = pd.DataFrame()
+        result["Source File"]         = uploaded_file.name
+        result["Line No"]             = range(1, len(df) + 1)
+        result["Product Description"] = df[desc_col].apply(clean_text) if desc_col else ""
+        result["HS Code"]             = df[hs_col].apply(clean_hs) if hs_col else ""
+        result["Qty"]                 = ""
+        result["SKU Number"]          = df[sku_col].apply(clean_text) if sku_col else ""
+        result["Current Container"]   = df[container_col].apply(clean_text) if container_col else ""
+
+        # Extract job number (last 6 digits from job number string)
+        if job_col:
+            def extract_job_no(val):
+                val = clean_text(val)
+                m = re.search(r'(\d{6})$', val)
+                return m.group(1) if m else val
+            result["Job Number"] = df[job_col].apply(extract_job_no)
+        else:
+            result["Job Number"] = ""
+
+        result = result[
+            (result["Product Description"] != "") &
+            (result["HS Code"] != "")
+        ]
+        return result[DOC_COLUMNS]
+
+    # ── Vevor internal logistics format (排柜单号, SKU, 英文申报名称, 中国出口HS, 箱号) ──
+    if is_vevor_internal:
+        import re as _re
+        cols = [str(c).strip() for c in raw.iloc[0].tolist()]
+        df = pd.read_excel(uploaded_file, header=0, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        job_col  = next((c for c in df.columns if "排柜单号" in c), None)
+        sku_col  = next((c for c in df.columns if c.upper() == "SKU"), None)
+        desc_col = next((c for c in df.columns if "英文申报名称" in c), None)
+        hs_col   = next((c for c in df.columns if "中国出口HS" in c or "出口HS" in c), None)
+        con_col  = next((c for c in df.columns if "箱号" in c), None)
+
+        if not desc_col or not hs_col:
+            return pd.DataFrame(columns=DOC_COLUMNS)
+
+        def extract_job_no2(val):
+            val = clean_text(val)
+            m = _re.search(r'(\d{6})$', val)
+            return m.group(1) if m else val
+
+        result = pd.DataFrame()
+        result["Source File"]         = uploaded_file.name
+        result["Line No"]             = range(1, len(df) + 1)
+        result["Product Description"] = df[desc_col].apply(clean_text) if desc_col else ""
+        result["HS Code"]             = df[hs_col].apply(clean_hs) if hs_col else ""
+        result["Qty"]                 = ""
+        result["SKU Number"]          = df[sku_col].apply(clean_text) if sku_col else ""
+        result["Current Container"]   = df[con_col].apply(clean_text) if con_col else ""
+        result["Job Number"]          = df[job_col].apply(extract_job_no2) if job_col else ""
+
+        result = result[
+            (result["Product Description"] != "") &
+            (result["HS Code"] != "") &
+            (result["HS Code"].str.len() >= 6)
+        ]
+        return result[DOC_COLUMNS]
+
+    # ── Standard invoice / packing list format ──
     header_containers = extract_containers_from_header(raw)
     fallback_container = "+".join(header_containers) if header_containers else ""
 
@@ -392,7 +504,6 @@ def normalize_document_file(uploaded_file):
             hs_col = col
         if qty_col is None and ("QTY" in col_upper or "QUANTITY" in col_upper):
             qty_col = col
-        # Detect per-row container column (e.g. "对应柜号")
         if container_col is None and ("柜号" in col or "CONTAINER" in col_upper):
             container_col = col
 
@@ -405,8 +516,9 @@ def normalize_document_file(uploaded_file):
     result["Product Description"] = df[product_col].apply(clean_text)
     result["HS Code"]             = df[hs_col].apply(clean_hs)
     result["Qty"]                 = df[qty_col].apply(clean_text) if qty_col else ""
+    result["SKU Number"]          = ""
+    result["Job Number"]          = ""
 
-    # Per-row container column takes priority; fall back to file-level header value
     if container_col:
         result["Current Container"] = df[container_col].apply(
             lambda x: clean_text(x) if clean_text(x) else fallback_container
@@ -444,6 +556,7 @@ def check_documents_against_risks(doc_df, risk_df):
     for _, doc_row in doc_df.iterrows():
         product = clean_text(doc_row["Product Description"])
         hs      = clean_hs(doc_row["HS Code"])
+        doc_sku = clean_text(str(doc_row.get("SKU Number", "") or ""))
         for _, risk_row in risk_df.iterrows():
             old_hs        = clean_hs(risk_row["Old HS"])
             product_match = product_matches_risk(product, risk_row)
