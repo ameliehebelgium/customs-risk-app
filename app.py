@@ -545,9 +545,11 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
-                "Job Number":                clean_text(str(doc_row.get("Job Number", "") or "")) or risk_row.get("Job Number", ""),
+                "Job Number":                clean_text(str(doc_row.get("Job Number", "") or "")),
                 "BL Number":                 risk_row.get("BL Number", ""),
-                "SKU Number":                clean_text(str(doc_row.get("SKU Number", "") or "")) or risk_row.get("SKU Number", ""),
+                "SKU Number":                clean_text(str(doc_row.get("SKU Number", "") or "")),
+                "Risk SKU Number":           risk_row.get("SKU Number", ""),
+                "Risk Job Number":           risk_row.get("Job Number", ""),
                 "Historical Product":        risk_row["Product Name"],
                 "Old HS Used Before":        old_hs,
                 "Duty Before":               risk_row["Duty Before"],
@@ -674,8 +676,8 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
                 [Paragraph("📋 HISTORICAL REFERENCE", section_style), ""],
                 [Paragraph("Container",  label_style), v(row, "Previous Container")],
                 [Paragraph("BL Number",  label_style), v(row, "BL Number")],
-                [Paragraph("Job Number", label_style), v(row, "Job Number")],
-                [Paragraph("SKU",        label_style), v(row, "SKU Number")],
+                [Paragraph("Job Number", label_style), v(row, "Risk Job Number")],
+                [Paragraph("SKU",        label_style), v(row, "Risk SKU Number")],
                 [Paragraph("MRN",        label_style), v(row, "Previous MRN")],
                 [Paragraph("Inspection", label_style), v(row, "Previous Inspection Date")],
                 [Paragraph("Product",    label_style), v(row, "Historical Product")],
@@ -1060,9 +1062,9 @@ def main():
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">BL Number</td>
                                                     <td style="font-weight:600; padding:3px 0;">{row.get("BL Number","—") or "—"}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Job Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Job Number","—") or "—"}</td></tr>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Risk Job Number","—") or "—"}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">SKU</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("SKU Number","—") or "—"}</td></tr>
+                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Risk SKU Number","—") or "—"}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">MRN</td>
                                                     <td style="font-weight:600; padding:3px 0;">{row.get("Previous MRN","—")}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Inspection</td>
