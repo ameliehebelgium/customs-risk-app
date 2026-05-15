@@ -44,7 +44,7 @@ LOGO_FILE  = Path("vevor_logo.png")
 # ─── Column definitions ───────────────────────────────────────────────────────
 COLUMNS = [
     "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
-    "BL Number", "Job Number", "Inspector",
+    "BL Number", "Job Number", "SKU Number", "Inspector",
     "Product Name", "Product Alias", "Declaration Description",
     "Old HS", "Corrected HS", "Duty Before", "Duty After",
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
@@ -234,15 +234,16 @@ def generate_risk_id(df):
 
 def make_duplicate_key(row):
     """
-    Duplicate = same SKU + same Old HS + same Corrected HS.
-    Product Name is NOT used — different SKUs with same product name are separate records.
-    If SKU is empty, fall back to Container No + MRN + Old HS + Corrected HS.
+    Same SKU + same Product Name + same Old HS + same Corrected HS = duplicate.
+    If SKU is empty, fall back to Container No + MRN + Product Name + HS codes.
+    This allows same SKU with different HS corrections to be stored as separate records.
     """
     sku = clean_text(row.get("SKU Number", "")).upper()
     if sku:
         return (
             "SKU",
             sku,
+            clean_text(row.get("Product Name", "")).upper(),
             clean_hs(row.get("Old HS", "")),
             clean_hs(row.get("Corrected HS", "")),
         )
