@@ -1024,73 +1024,53 @@ def main():
                                     f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td>'
                                     f'<td style="color:#555; padding:3px 0; font-style:italic;">{hs_note_val}</td></tr>'
                                 ) if hs_note_val else ""
+                                def _row(label, val, val_style="font-weight:600;"):
+                                    return (
+                                        f'<div style="display:flex; padding:3px 0; font-size:0.85rem; border-bottom:1px solid #f0f0f0;">'
+                                        f'<div style="color:#666; min-width:110px; white-space:nowrap;">{label}</div>'
+                                        f'<div style="{val_style}">{val}</div>'
+                                        f'</div>'
+                                    )
+
+                                left_html = (
+                                    '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
+                                    + _row("Container",  row.get("Current Container","—") or "—")
+                                    + _row("BL Number",  row.get("BL Number","—") or "—")
+                                    + _row("Job Number", row.get("Job Number","—") or "—")
+                                    + _row("SKU",        row.get("SKU Number","—") or "—")
+                                    + _row("MRN",        "—", "color:#aaa;")
+                                    + _row("Inspection", "—", "color:#aaa;")
+                                    + _row("Product",    row.get("Current Product","—") or "—")
+                                    + _row("Current HS", row.get("Current HS","—") or "—", f"font-weight:600; color:{border};")
+                                    + _row("✅ Should be", row.get("Corrected HS","—") or "—", "font-weight:700; color:#1a6e3c;")
+                                )
+
+                                right_html = (
+                                    '<div style="font-weight:700; color:#555; margin-bottom:8px; font-size:0.9rem;">📋 HISTORICAL REFERENCE</div>'
+                                    + _row("Risk ID",    row.get("Matched Risk ID","—") or "—")
+                                    + _row("Container",  row.get("Previous Container","—") or "—")
+                                    + _row("BL Number",  row.get("BL Number","—") or "—")
+                                    + _row("Job Number", row.get("Risk Job Number","—") or "—")
+                                    + _row("SKU",        row.get("Risk SKU Number","—") or "—")
+                                    + _row("MRN",        row.get("Previous MRN","—") or "—")
+                                    + _row("Inspection", row.get("Previous Inspection Date","—") or "—")
+                                    + _row("Product",    row.get("Historical Product","—") or "—")
+                                    + _row("Old HS",     row.get("Old HS Used Before","—") or "—", f"font-weight:600; color:{border};")
+                                    + _row("✅ Corrected to", row.get("Corrected HS","—") or "—", "font-weight:700; color:#1a6e3c;")
+                                    + (_row("📝 Reason", hs_note_val, "color:#555; font-style:italic;") if hs_note_val else "")
+                                )
+
                                 st.markdown(f"""
-                                <div style="border:2px solid {border}; border-radius:10px;
-                                            background:{bg}; padding:16px; margin-bottom:16px;">
-                                    <div style="font-weight:700; font-size:1.05rem;
-                                                color:{border}; margin-bottom:12px;">
-                                        {icon} {row.get("Action Required","")} &nbsp;|&nbsp;
-                                        {row.get("Message","")}
+                                <div style="border:2px solid {border}; border-radius:10px; background:{bg}; padding:16px; margin-bottom:16px;">
+                                    <div style="font-weight:700; font-size:1.05rem; color:{border}; margin-bottom:12px;">
+                                        {icon} {row.get("Action Required","")} &nbsp;|&nbsp; {row.get("Message","")}
                                     </div>
                                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-                                        <div style="background:white; border-radius:8px;
-                                                    padding:12px; border:1px solid #ddd;">
-                                            <div style="font-weight:700; color:#1a3c6e;
-                                                        margin-bottom:8px; font-size:0.9rem;">
-                                                📦 CURRENT SHIPMENT
-                                            </div>
-                                            <table style="width:100%; font-size:0.85rem; border-collapse:collapse;">
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">　</td>
-                                                    <td style="padding:3px 0;">　</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Container</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Current Container","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">BL Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("BL Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Job Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Job Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">SKU</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("SKU Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">MRN</td>
-                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Inspection</td>
-                                                    <td style="color:#aaa; padding:3px 0;">—</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Product</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Current Product","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Current HS</td>
-                                                    <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Current HS","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Should be</td>
-                                                    <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
-                                            </table>
+                                        <div style="background:white; border-radius:8px; padding:12px; border:1px solid #ddd;">
+                                            {left_html}
                                         </div>
-                                        <div style="background:white; border-radius:8px;
-                                                    padding:12px; border:1px solid #ddd;">
-                                            <div style="font-weight:700; color:#555;
-                                                        margin-bottom:8px; font-size:0.9rem;">
-                                                📋 HISTORICAL REFERENCE
-                                            </div>
-                                            <table style="width:100%; font-size:0.85rem; border-collapse:collapse;">
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Risk ID</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Matched Risk ID","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Container</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous Container","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">BL Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("BL Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Job Number</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Risk Job Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">SKU</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Risk SKU Number","—") or "—"}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">MRN</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous MRN","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Inspection</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Previous Inspection Date","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Product</td>
-                                                    <td style="font-weight:600; padding:3px 0;">{row.get("Historical Product","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">Old HS</td>
-                                                    <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Old HS Used Before","—")}</td></tr>
-                                                <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Corrected to</td>
-                                                    <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
-                                                {hs_note_html}
-                                            </table>
+                                        <div style="background:white; border-radius:8px; padding:12px; border:1px solid #ddd;">
+                                            {right_html}
                                         </div>
                                     </div>
                                 </div>
