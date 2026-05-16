@@ -1019,6 +1019,11 @@ def main():
                             bg     = "#fff5f5" if color == "red" else "#fff8f0"
                             icon   = "🚨" if color == "red" else "⚠️"
                             for _, row in df.iterrows():
+                                hs_note_val = row.get("HS Note", "") or ""
+                                hs_note_html = (
+                                    f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td>'
+                                    f'<td style="color:#555; padding:3px 0; font-style:italic;">{hs_note_val}</td></tr>'
+                                ) if hs_note_val else ""
                                 st.markdown(f"""
                                 <div style="border:2px solid {border}; border-radius:10px;
                                             background:{bg}; padding:16px; margin-bottom:16px;">
@@ -1084,7 +1089,7 @@ def main():
                                                     <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Old HS Used Before","—")}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Corrected to</td>
                                                     <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
-                                                {f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td><td style="color:#555; padding:3px 0; font-style:italic;">{row.get("HS Note","")}</td></tr>' if row.get("HS Note","") else ""}
+                                                {hs_note_html}
                                             </table>
                                         </div>
                                     </div>
