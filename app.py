@@ -531,6 +531,8 @@ def check_documents_against_risks(doc_df, risk_df):
                 message  = "Product description matches a historical risk. Please confirm whether the HS has been updated."
             else:
                 continue
+            corrected_hs = clean_hs(risk_row["Corrected HS"])
+            hs_note = "Inspected but HS remains the same" if (old_hs != "" and old_hs == corrected_hs) else ""
             results.append({
                 "Severity":                  severity,
                 "Action Required":           "STOP & REVIEW" if severity == "RED" else "MANUAL REVIEW",
@@ -540,7 +542,8 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Qty":                       doc_row["Qty"],
                 "Source File":               doc_row["Source File"],
                 "Line No":                   doc_row["Line No"],
-                "Corrected HS":              risk_row["Corrected HS"],
+                "Corrected HS":              corrected_hs,
+                "HS Note":                   hs_note,
                 "Matched Risk ID":           risk_row["Risk ID"],
                 "Previous Inspection Date":  risk_row["Inspection Date"],
                 "Previous Container":        risk_row["Container No"],
@@ -684,6 +687,12 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
                 [Paragraph("Old HS",     label_style), v(row, "Old HS Used Before", red_val)],
                 [Paragraph("✅ Corrected to", label_style), v(row, "Corrected HS", green_val)],
             ]
+            hs_note = str(row.get("HS Note", "") or "")
+            if hs_note:
+                rows_right.append([
+                    Paragraph("📝 Reason", ParagraphStyle("note_label", parent=label_style, textColor=colors.HexColor("#888888"), fontName="Helvetica-Oblique")),
+                    Paragraph(hs_note,     ParagraphStyle("note_val",   parent=label_style, textColor=colors.HexColor("#555555"), fontName="Helvetica-Oblique")),
+                ])
 
             def make_inner(rows_data):
                 t = Table(rows_data, colWidths=[3*cm, 9*cm])
@@ -1075,6 +1084,7 @@ def main():
                                                     <td style="font-weight:600; color:{border}; padding:3px 0;">{row.get("Old HS Used Before","—")}</td></tr>
                                                 <tr><td style="color:#666; padding:3px 8px 3px 0; white-space:nowrap;">✅ Corrected to</td>
                                                     <td style="font-weight:700; color:#1a6e3c; padding:3px 0;">{row.get("Corrected HS","—")}</td></tr>
+                                                {f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td><td style="color:#555; padding:3px 0; font-style:italic;">{row.get("HS Note","")}</td></tr>' if row.get("HS Note","") else ""}
                                             </table>
                                         </div>
                                     </div>
@@ -1236,13 +1246,15 @@ def main():
             st.info("No risk cases available yet.")
         else:
             # Filter bar
-            fc1, fc2, fc3 = st.columns(3)
+            fc1, fc2, fc3, fc4 = st.columns(4)
             with fc1:
                 filter_status = st.selectbox("Filter by Status", ["All", "active", "monitoring", "solved"])
             with fc2:
                 filter_hs = st.text_input("Filter by Old HS (exact)")
             with fc3:
                 filter_sku = st.text_input("Filter by SKU (contains)")
+            with fc4:
+                filter_rid = st.text_input("Filter by Risk ID (contains)")
 
             filtered = current_df.copy()
             if filter_status != "All":
@@ -1251,6 +1263,8 @@ def main():
                 filtered = filtered[filtered["Old HS"] == filter_hs.strip()]
             if filter_sku:
                 filtered = filtered[filtered["SKU Number"].str.contains(filter_sku.strip(), case=False, na=False)]
+            if filter_rid:
+                filtered = filtered[filtered["Risk ID"].str.contains(filter_rid.strip(), case=False, na=False)]
 
             st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
 
