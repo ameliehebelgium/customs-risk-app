@@ -1036,7 +1036,7 @@ def main():
 
                                 left_html = (
                                     '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
-                                    + _row("&nbsp;", "&nbsp;", "color:transparent;")
+                                    + _row("📄 File", row.get("Source File","—") or "—", "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
                                     + _row("Container",  row.get("Current Container","—") or "—")
                                     + _row("BL Number",  row.get("BL Number","—") or "—")
                                     + _row("Job Number", row.get("Job Number","—") or "—")
