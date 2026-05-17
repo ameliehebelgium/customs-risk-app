@@ -471,8 +471,24 @@ def normalize_document_file(uploaded_file):
     header_containers = extract_containers_from_header(raw)
     fallback_container = "+".join(header_containers) if header_containers else ""
 
-    header_row = find_document_header_row(uploaded_file)
-    df = pd.read_excel(uploaded_file, header=header_row, dtype=str)
+    # 直接从 raw 找 header 行，避免重复读文件导致指针问题
+    header_row = 0
+    for i in range(len(raw)):
+        row_text = " ".join([clean_text(x).upper() for x in raw.iloc[i].tolist()])
+        if ("DESCRIPTION" in row_text or "ITEM" in row_text) and ("HS" in row_text or "HTS" in row_text):
+            header_row = i
+            break
+    # 用 raw 直接构建有表头的 df，不重新读文件
+    df = raw.iloc[header_row + 1:].copy()
+    raw_headers = [str(c).replace("\n", " ").strip() for c in raw.iloc[header_row].tolist()]
+    named_headers = []
+    for idx, h in enumerate(raw_headers):
+        if h.lower() in ("nan", "none", ""):
+            named_headers.append(f"Unnamed: {idx}")
+        else:
+            named_headers.append(h)
+    df.columns = named_headers
+    df = df.reset_index(drop=True)
     df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
 
     product_col = hs_col = qty_col = container_col = sku_col_pl = None
