@@ -595,6 +595,7 @@ def check_documents_against_risks(doc_df, risk_df):
                 "Previous Container":        risk_row["Container No"],
                 "Previous MRN":              risk_row["MRN"],
                 "Job Number":                clean_text(str(doc_row.get("Job Number", "") or "")),
+                "Current BL Number":         clean_text(str(doc_row.get("BL Number", "") or "")),
                 "BL Number":                 risk_row.get("BL Number", ""),
                 "SKU Number":                clean_text(str(doc_row.get("SKU Number", "") or "")),
                 "Risk SKU Number":           risk_row.get("SKU Number", ""),
@@ -1070,7 +1071,11 @@ def main():
                             merged_rows = []
                             seen = {}
                             for _, row_s in df.iterrows():
-                                key = (row_s.get("Current Product",""), row_s.get("Current HS",""), row_s.get("Matched Risk ID",""))
+                                key = (
+                                    str(row_s.get("Current Product","")).strip().upper(),
+                                    str(row_s.get("Current HS","")).strip(),
+                                    str(row_s.get("Matched Risk ID","")).strip()
+                                )
                                 src = str(row_s.get("Source File","")).strip()
                                 if key not in seen:
                                     seen[key] = {"row": row_s.to_dict(), "files": []}
@@ -1105,7 +1110,7 @@ def main():
                                     '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
                                     + _row("PO N°",        _v(row.get("Source File")), "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
                                     + _row("Container",    _v(row.get("Current Container")))
-                                    + _row("BL Number",    _v(row.get("BL Number")))
+                                    + _row("BL Number",    _v(row.get("Current BL Number")))
                                     + _row("Job Number",   _v(row.get("Job Number")))
                                     + _row("SKU",          _v(row.get("SKU Number")))
                                     + _row("MRN",          "—", "color:#aaa;")
