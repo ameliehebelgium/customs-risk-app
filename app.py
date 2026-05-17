@@ -81,9 +81,11 @@ def load_users() -> dict:
             return json.load(f)
     # Default users on first run
     default = {
-        "admin":   {"password": _hash("admin123"),   "role": "admin",   "display": "Admin"},
-        "broker1": {"password": _hash("broker2026"), "role": "broker",  "display": "Broker User"},
-        "visitor": {"password": _hash("visit2026"),  "role": "visitor", "display": "Visitor"},
+        "admin":   {"password": _hash("admin123"),      "role": "admin",   "display": "Admin"},
+        "broker1": {"password": _hash("broker2026"),    "role": "broker",  "display": "Broker User"},
+        "visitor": {"password": _hash("visit2026"),     "role": "visitor", "display": "Visitor"},
+        "geodis":  {"password": _hash("geodis123456!"), "role": "broker", "display": "Geodis"},
+        "rhenus":  {"password": _hash("rhenus123456!"), "role": "broker", "display": "Rhenus"},
     }
     save_users(default)
     return default
