@@ -1064,7 +1064,18 @@ def main():
                             border = "#c0392b" if color == "red" else "#d35400"
                             bg     = "#fff5f5" if color == "red" else "#fff8f0"
                             icon   = "🚨" if color == "red" else "⚠️"
-                            for _, row in df.iterrows():
+
+                            # 合并同一产品+HS+Risk ID 的多个 Source File
+                            group_keys = ["Current Product", "Current HS", "Matched Risk ID"]
+                            merged_rows = []
+                            for _, grp in df.groupby(group_keys, sort=False):
+                                base = grp.iloc[0].to_dict()
+                                all_files = grp["Source File"].dropna().astype(str).tolist()
+                                all_files = [f for f in all_files if f.strip() and f.lower() not in ("nan","none","")]
+                                base["Source File"] = ", ".join(sorted(set(all_files))) if all_files else "—"
+                                merged_rows.append(base)
+
+                            for row in merged_rows:
                                 hs_note_val = row.get("HS Note", "") or ""
                                 hs_note_html = (
                                     f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td>'
@@ -1085,7 +1096,7 @@ def main():
 
                                 left_html = (
                                     '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
-                                    + _row("📄 File",      _v(row.get("Source File")), "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
+                                    + _row("PO N°",        _v(row.get("Source File")), "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
                                     + _row("Container",    _v(row.get("Current Container")))
                                     + _row("BL Number",    _v(row.get("BL Number")))
                                     + _row("Job Number",   _v(row.get("Job Number")))
