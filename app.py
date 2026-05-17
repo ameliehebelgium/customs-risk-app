@@ -1068,11 +1068,18 @@ def main():
                             # 合并同一产品+HS+Risk ID 的多个 Source File
                             group_keys = ["Current Product", "Current HS", "Matched Risk ID"]
                             merged_rows = []
-                            for _, grp in df.groupby(group_keys, sort=False):
-                                base = grp.iloc[0].to_dict()
-                                all_files = grp["Source File"].dropna().astype(str).tolist()
-                                all_files = [f for f in all_files if f.strip() and f.lower() not in ("nan","none","")]
-                                base["Source File"] = ", ".join(sorted(set(all_files))) if all_files else "—"
+                            seen = {}
+                            for _, row_s in df.iterrows():
+                                key = (row_s.get("Current Product",""), row_s.get("Current HS",""), row_s.get("Matched Risk ID",""))
+                                src = str(row_s.get("Source File","")).strip()
+                                if key not in seen:
+                                    seen[key] = {"row": row_s.to_dict(), "files": []}
+                                if src and src.lower() not in ("nan","none",""):
+                                    seen[key]["files"].append(src)
+                            for key, data in seen.items():
+                                base = data["row"]
+                                all_files = sorted(set(data["files"]))
+                                base["Source File"] = ", ".join(all_files) if all_files else "—"
                                 merged_rows.append(base)
 
                             for row in merged_rows:
