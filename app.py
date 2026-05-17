@@ -378,13 +378,19 @@ def extract_po_number(raw_df) -> str:
     """Scan the first 20 rows for 'PO NO' and return the value (e.g. 'FR-052051')."""
     import re
     for i in range(min(len(raw_df), 20)):
-        row_values = [clean_text(x) for x in raw_df.iloc[i].tolist()]
+        row_values = [str(x).strip() for x in raw_df.iloc[i].tolist()]
         for j, val in enumerate(row_values):
-            if re.search(r'PO\s*NO', val, re.IGNORECASE):
-                for k in range(j + 1, min(j + 4, len(row_values))):
-                    candidate = row_values[k].strip()
-                    if candidate and candidate.upper() not in ("", "NONE", "NAN"):
-                        return candidate
+            if not re.search(r'PO\s*NO', val, re.IGNORECASE):
+                continue
+            # Case 1: "PO NO.: FR-052051" — value embedded in same cell
+            m = re.search(r'PO\s*NO\.?\s*:?\s*([A-Z]{1,4}-?\d{4,8})', val, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+            # Case 2: label in one cell, value in next non-empty cell
+            for k in range(j + 1, min(j + 4, len(row_values))):
+                candidate = row_values[k].strip()
+                if candidate and candidate.lower() not in ("", "none", "nan"):
+                    return candidate
     return ""
 
 
@@ -502,8 +508,12 @@ def normalize_document_file(uploaded_file):
     if product_col is None or hs_col is None:
         return pd.DataFrame(columns=DOC_COLUMNS)
 
-    # Use PO NO. as the source label (e.g. "FR-052051"), fall back to filename
+    # Use PO NO. as the source label (e.g. "FR-052051"), fall back to job number in filename
     po_number = extract_po_number(raw)
+    if not po_number:
+        import re as _re_fn
+        m = _re_fn.search(r'(\d{6})', uploaded_file.name)
+        po_number = m.group(1) if m else ""
     source_label = po_number if po_number else uploaded_file.name
 
     result = pd.DataFrame()
