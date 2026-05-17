@@ -532,14 +532,16 @@ def normalize_document_file(uploaded_file):
         po_number = m.group(1) if m else ""
     source_label = po_number if po_number else uploaded_file.name
 
-    result = pd.DataFrame()
-    result["Source File"]         = source_label
-    result["Line No"]             = range(1, len(df) + 1)
-    result["Product Description"] = df[product_col].apply(clean_text)
-    result["HS Code"]             = df[hs_col].apply(clean_hs)
-    result["Qty"]                 = df[qty_col].apply(clean_text) if qty_col else ""
-    result["SKU Number"]          = df[sku_col_pl].apply(clean_text) if sku_col_pl else ""
-    result["Job Number"]          = ""
+    # 先建 Series 列，最后再赋标量，避免 pandas index 对齐把标量列冲成 NaN
+    result = pd.DataFrame({
+        "Line No":             range(1, len(df) + 1),
+        "Product Description": df[product_col].apply(clean_text).values,
+        "HS Code":             df[hs_col].apply(clean_hs).values,
+        "Qty":                 df[qty_col].apply(clean_text).values if qty_col else "",
+        "SKU Number":          df[sku_col_pl].apply(clean_text).values if sku_col_pl else "",
+        "Job Number":          "",
+    })
+    result["Source File"] = source_label
 
     if container_col:
         result["Current Container"] = df[container_col].apply(
