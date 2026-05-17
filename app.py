@@ -381,12 +381,14 @@ def extract_po_number(raw_df) -> str:
         row_values = [clean_text(x) for x in raw_df.iloc[i].tolist()]
         for j, val in enumerate(row_values):
             if re.search(r'PO\s*NO', val, re.IGNORECASE):
-                # Value is in the next non-empty cell
                 for k in range(j + 1, min(j + 4, len(row_values))):
                     candidate = row_values[k].strip()
                     if candidate and candidate.upper() not in ("", "NONE", "NAN"):
                         return candidate
     return ""
+
+
+def normalize_document_file(uploaded_file):
     import re as _re
     raw = pd.read_excel(uploaded_file, header=None, dtype=str)
 
