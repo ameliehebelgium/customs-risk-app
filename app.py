@@ -543,6 +543,10 @@ def normalize_document_file(uploaded_file):
     })
     result["Source File"] = source_label
 
+    # Forward fill: 附属 SKU 行的 Product/HS 为空时，继承上方产品行的值
+    result["Product Description"] = result["Product Description"].replace("", pd.NA).ffill().fillna("")
+    result["HS Code"] = result["HS Code"].replace("", pd.NA).ffill().fillna("")
+
     if container_col:
         result["Current Container"] = df[container_col].apply(
             lambda x: clean_text(x) if clean_text(x) else fallback_container
