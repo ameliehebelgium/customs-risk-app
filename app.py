@@ -374,7 +374,19 @@ def extract_containers_from_header(raw_df) -> list:
     return containers
 
 
-def normalize_document_file(uploaded_file):
+def extract_po_number(raw_df) -> str:
+    """Scan the first 20 rows for 'PO NO' and return the value (e.g. 'FR-052051')."""
+    import re
+    for i in range(min(len(raw_df), 20)):
+        row_values = [clean_text(x) for x in raw_df.iloc[i].tolist()]
+        for j, val in enumerate(row_values):
+            if re.search(r'PO\s*NO', val, re.IGNORECASE):
+                # Value is in the next non-empty cell
+                for k in range(j + 1, min(j + 4, len(row_values))):
+                    candidate = row_values[k].strip()
+                    if candidate and candidate.upper() not in ("", "NONE", "NAN"):
+                        return candidate
+    return ""
     import re as _re
     raw = pd.read_excel(uploaded_file, header=None, dtype=str)
 
@@ -469,11 +481,31 @@ def normalize_document_file(uploaded_file):
         if sku_col_pl is None and "SKU" in col_upper:
             sku_col_pl = col
 
+    # Fallback: detect unnamed column whose values look like SKU codes
+    # (alphanumeric mix, length >= 8) — handles packing lists where SKU has no header
+    if sku_col_pl is None:
+        import re as _re2
+        def _looks_like_sku(val):
+            s = str(val).strip()
+            return (len(s) >= 8 and bool(_re2.search(r'[A-Za-z]', s))
+                    and bool(_re2.search(r'\d', s)))
+        for col in df.columns:
+            if "Unnamed" in str(col) or str(col).strip() in ("", "None", "nan"):
+                sample = df[col].dropna().head(20).tolist()
+                sku_like = sum(1 for v in sample if _looks_like_sku(v))
+                if sku_like >= max(1, len(sample) * 0.5):
+                    sku_col_pl = col
+                    break
+
     if product_col is None or hs_col is None:
         return pd.DataFrame(columns=DOC_COLUMNS)
 
+    # Use PO NO. as the source label (e.g. "FR-052051"), fall back to filename
+    po_number = extract_po_number(raw)
+    source_label = po_number if po_number else uploaded_file.name
+
     result = pd.DataFrame()
-    result["Source File"]         = uploaded_file.name
+    result["Source File"]         = source_label
     result["Line No"]             = range(1, len(df) + 1)
     result["Product Description"] = df[product_col].apply(clean_text)
     result["HS Code"]             = df[hs_col].apply(clean_hs)
@@ -1026,6 +1058,11 @@ def main():
                                     f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td>'
                                     f'<td style="color:#555; padding:3px 0; font-style:italic;">{hs_note_val}</td></tr>'
                                 ) if hs_note_val else ""
+                                def _v(val):
+                                    """Return val as string, replacing nan/None/empty with '—'."""
+                                    s = str(val).strip() if val is not None else ""
+                                    return s if s and s.lower() not in ("nan", "none", "") else "—"
+
                                 def _row(label, val, val_style="font-weight:600;"):
                                     return (
                                         f'<div style="display:flex; padding:3px 0; font-size:0.85rem; border-bottom:1px solid #f0f0f0;">'
@@ -1036,30 +1073,30 @@ def main():
 
                                 left_html = (
                                     '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
-                                    + _row("📄 File", row.get("Source File","—") or "—", "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
-                                    + _row("Container",  row.get("Current Container","—") or "—")
-                                    + _row("BL Number",  row.get("BL Number","—") or "—")
-                                    + _row("Job Number", row.get("Job Number","—") or "—")
-                                    + _row("SKU",        row.get("SKU Number","—") or "—")
-                                    + _row("MRN",        "—", "color:#aaa;")
-                                    + _row("Inspection", "—", "color:#aaa;")
-                                    + _row("Product",    row.get("Current Product","—") or "—")
-                                    + _row("Current HS", row.get("Current HS","—") or "—", f"font-weight:600; color:{border};")
-                                    + _row("✅ Should be", row.get("Corrected HS","—") or "—", "font-weight:700; color:#1a6e3c;")
+                                    + _row("📄 File",      _v(row.get("Source File")), "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
+                                    + _row("Container",    _v(row.get("Current Container")))
+                                    + _row("BL Number",    _v(row.get("BL Number")))
+                                    + _row("Job Number",   _v(row.get("Job Number")))
+                                    + _row("SKU",          _v(row.get("SKU Number")))
+                                    + _row("MRN",          "—", "color:#aaa;")
+                                    + _row("Inspection",   "—", "color:#aaa;")
+                                    + _row("Product",      _v(row.get("Current Product")))
+                                    + _row("Current HS",   _v(row.get("Current HS")), f"font-weight:600; color:{border};")
+                                    + _row("✅ Should be", _v(row.get("Corrected HS")), "font-weight:700; color:#1a6e3c;")
                                 )
 
                                 right_html = (
                                     '<div style="font-weight:700; color:#555; margin-bottom:8px; font-size:0.9rem;">📋 HISTORICAL REFERENCE</div>'
-                                    + _row("Risk ID",    row.get("Matched Risk ID","—") or "—")
-                                    + _row("Container",  row.get("Previous Container","—") or "—")
-                                    + _row("BL Number",  row.get("BL Number","—") or "—")
-                                    + _row("Job Number", row.get("Risk Job Number","—") or "—")
-                                    + _row("SKU",        row.get("Risk SKU Number","—") or "—")
-                                    + _row("MRN",        row.get("Previous MRN","—") or "—")
-                                    + _row("Inspection", row.get("Previous Inspection Date","—") or "—")
-                                    + _row("Product",    row.get("Historical Product","—") or "—")
-                                    + _row("Old HS",     row.get("Old HS Used Before","—") or "—", f"font-weight:600; color:{border};")
-                                    + _row("✅ Corrected to", row.get("Corrected HS","—") or "—", "font-weight:700; color:#1a6e3c;")
+                                    + _row("Risk ID",         _v(row.get("Matched Risk ID")))
+                                    + _row("Container",       _v(row.get("Previous Container")))
+                                    + _row("BL Number",       _v(row.get("BL Number")))
+                                    + _row("Job Number",      _v(row.get("Risk Job Number")))
+                                    + _row("SKU",             _v(row.get("Risk SKU Number")))
+                                    + _row("MRN",             _v(row.get("Previous MRN")))
+                                    + _row("Inspection",      _v(row.get("Previous Inspection Date")))
+                                    + _row("Product",         _v(row.get("Historical Product")))
+                                    + _row("Old HS",          _v(row.get("Old HS Used Before")), f"font-weight:600; color:{border};")
+                                    + _row("✅ Corrected to", _v(row.get("Corrected HS")), "font-weight:700; color:#1a6e3c;")
                                     + (_row("📝 Reason", hs_note_val, "color:#555; font-style:italic;") if hs_note_val else "")
                                 )
 
