@@ -44,20 +44,13 @@ LOGO_FILE  = Path("vevor_logo.png")
 # ─── Column definitions ───────────────────────────────────────────────────────
 COLUMNS = [
     "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
-    "BL Number", "Job Number", "Inspector",
+    "BL Number", "Job Number", "SKU Number", "Inspector",
     "Product Name", "Product Alias", "Declaration Description",
     "Old HS", "Corrected HS", "Duty Before", "Duty After",
     "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
     "Status", "Notes",
 ]
 DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number", "Line No", "Product Description", "HS Code", "Qty"]
-
-DISPLAY_COLUMNS = [
-    "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
-    "Job Number", "SKU Number", "Product Name",
-    "Old HS", "Corrected HS", "Duty Before", "Duty After",
-    "Findings Type", "Status", "Inspector", "Notes",
-]
 
 DISPLAY_COLUMNS = [
     "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
@@ -1343,9 +1336,9 @@ def main():
                 filtered = filtered[filtered["Status"] == filter_status]
             if filter_hs:
                 filtered = filtered[filtered["Old HS"] == filter_hs.strip()]
-            if filter_sku:
+            if filter_sku and "SKU Number" in filtered.columns:
                 filtered = filtered[filtered["SKU Number"].str.contains(filter_sku.strip(), case=False, na=False)]
-            if filter_rid:
+            if filter_rid and "Risk ID" in filtered.columns:
                 filtered = filtered[filtered["Risk ID"].str.contains(filter_rid.strip(), case=False, na=False)]
 
             st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
