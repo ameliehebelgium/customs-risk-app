@@ -1343,6 +1343,30 @@ def main():
 
             st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
 
+            # ── One-click download of the full database ──
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                full_buf = io.BytesIO()
+                current_df.to_excel(full_buf, index=False, engine="openpyxl")
+                st.download_button(
+                    label=f"⬇️ Download ALL Data ({len(current_df)} cases, Excel)",
+                    data=full_buf.getvalue(),
+                    file_name=f"RiskDatabase_ALL_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with dl_col2:
+                if len(filtered) != len(current_df):
+                    filtered_buf = io.BytesIO()
+                    filtered.to_excel(filtered_buf, index=False, engine="openpyxl")
+                    st.download_button(
+                        label=f"⬇️ Download Filtered ({len(filtered)} cases, Excel)",
+                        data=filtered_buf.getvalue(),
+                        file_name=f"RiskDatabase_Filtered_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
             if is_broker:
                 show_cols = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
                 editable = filtered[show_cols].copy()
