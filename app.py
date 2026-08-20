@@ -20,7 +20,34 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 SHEET_ID   = "1X6EGJDD3gmzAtR_VJF076Wlg-FuspiLsVyekGQ6fJG4"
-SHEET_NAME = "Feuille 1"
+SHEET_NAME = "Feuille 1"   # expected tab name — used as a hint only, not load-bearing
+SHEET_GID  = None          # optional: stable numeric tab id (see .../edit#gid=NNNN in the
+                           # sheet's browser URL). If set, this is tried first and survives
+                           # the tab being renamed or reordered. Safe to leave as None.
+
+
+class WorksheetLocateError(RuntimeError):
+    """Raised when the risk-database worksheet can't be found by gid, name, or header."""
+
+
+def _find_worksheet_by_header(spreadsheet):
+    """Self-healing fallback: scan every tab in the spreadsheet and return the one
+    whose header row matches our expected columns. This is what makes the app
+    survive a tab being renamed (e.g. someone renaming 'Feuille 1', or Google
+    Sheets creating a new blank 'Feuille 1' tab) — instead of silently reading an
+    empty/wrong tab, it finds the real data wherever it currently lives."""
+    candidates = [
+        ws for ws in spreadsheet.worksheets()
+        if ws.row_values(1)[:1] == COLUMNS[:1]
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # More than one tab has a matching header (shouldn't normally happen) —
+    # prefer the one that actually holds the most rows.
+    return max(candidates, key=lambda w: w.row_count)
+
 
 @st.cache_resource(ttl=30)
 def _get_gsheet():
@@ -35,7 +62,31 @@ def _get_gsheet():
     else:
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    spreadsheet = gc.open_by_key(SHEET_ID)
+
+    # 1) Preferred: stable numeric gid — immune to renames/reordering.
+    if SHEET_GID is not None:
+        try:
+            return spreadsheet.get_worksheet_by_id(SHEET_GID)
+        except Exception:
+            pass
+
+    # 2) By configured tab name.
+    try:
+        return spreadsheet.worksheet(SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    # 3) Self-healing: locate the tab by its header row, whatever it's named.
+    ws = _find_worksheet_by_header(spreadsheet)
+    if ws is not None:
+        return ws
+
+    raise WorksheetLocateError(
+        "Could not find the risk-case worksheet by gid, name, or header row. "
+        f"Tabs currently in the sheet: {[w.title for w in spreadsheet.worksheets()]}. "
+        "The tab may have been deleted — check the Google Sheet directly."
+    )
 
 # ─── File paths ───────────────────────────────────────────────────────────────
 USERS_FILE = Path("users.json")
@@ -179,6 +230,14 @@ def load_database() -> pd.DataFrame:
     """Load risk database from Google Sheets."""
     try:
         ws = _get_gsheet()
+    except WorksheetLocateError as e:
+        st.error(
+            f"⚠️ Could not locate the risk database sheet ({e}). "
+            "This is different from having zero cases — please check the Google Sheet "
+            "before assuming data is missing."
+        )
+        return pd.DataFrame(columns=COLUMNS)
+    try:
         data = ws.get_all_records(default_blank="")
         if not data:
             return pd.DataFrame(columns=COLUMNS)
@@ -206,6 +265,21 @@ def save_database(df: pd.DataFrame):
             df[col] = df[col].apply(format_date)
         df = df.fillna("").astype(str)
         ws = _get_gsheet()
+
+        # Safety guard: never let an accidentally-empty save silently wipe real data
+        # (e.g. if the in-memory dataframe lost its rows because an earlier load
+        # couldn't find the sheet). A genuine "sheet already has data, now saving
+        # zero rows" is almost always a bug, not an intentional wipe.
+        existing_rows = max(0, len(ws.get_all_values()) - 1)
+        if len(df) == 0 and existing_rows > 0:
+            st.error(
+                "⚠️ Refused to save: the new data is empty but the sheet currently "
+                f"has {existing_rows} row(s). This looks like a lookup/display bug, "
+                "not an intentional 'delete everything' — check the Google Sheet "
+                "before retrying."
+            )
+            return
+
         # Clear and rewrite
         ws.clear()
         ws.update([COLUMNS] + df[COLUMNS].values.tolist())
