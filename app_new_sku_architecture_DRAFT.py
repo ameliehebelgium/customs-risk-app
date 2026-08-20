@@ -50,7 +50,7 @@ def _find_worksheet_by_header(spreadsheet):
 
 
 @st.cache_resource(ttl=30)
-def _get_gsheet():
+def _get_gclient():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -61,7 +61,12 @@ def _get_gsheet():
         )
     else:
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
-    gc = gspread.authorize(creds)
+    return gspread.authorize(creds)
+
+
+@st.cache_resource(ttl=30)
+def _get_gsheet():
+    gc = _get_gclient()
     spreadsheet = gc.open_by_key(SHEET_ID)
 
     # 1) Preferred: stable numeric gid — immune to renames/reordering.
@@ -87,6 +92,48 @@ def _get_gsheet():
         f"Tabs currently in the sheet: {[w.title for w in spreadsheet.worksheets()]}. "
         "The tab may have been deleted — check the Google Sheet directly."
     )
+
+
+# ─── Automatic backups ────────────────────────────────────────────────────────
+# A full copy of the live spreadsheet, at most once per day, named to match the
+# manual backup convention that already saved this database once ("Customs Risk
+# Database BACKUP YYYY-MM-DD"). Purely additive — never touches or deletes
+# existing data or older backups.
+BACKUP_TITLE_PREFIX = "Customs Risk Database BACKUP "
+
+
+def _today_backup_title() -> str:
+    return f"{BACKUP_TITLE_PREFIX}{date.today().isoformat()}"
+
+
+def backup_spreadsheet_if_due(force: bool = False) -> bool:
+    """Create a dated full copy of the live spreadsheet (see app.py for full
+    docstring — kept identical between the two files on purpose). Never raises."""
+    try:
+        gc = _get_gclient()
+        if force:
+            title = f"{_today_backup_title()} {datetime.now().strftime('%H-%M')}"
+        else:
+            title = _today_backup_title()
+            if gc.list_spreadsheet_files(title=title):
+                return False
+        gc.copy(SHEET_ID, title=title, copy_permissions=True, copy_comments=False)
+        return True
+    except Exception as e:
+        st.session_state["_last_backup_error"] = str(e)
+        return False
+
+
+def list_backups() -> list:
+    try:
+        gc = _get_gclient()
+        files = gc.list_spreadsheet_files()
+        backups = [f for f in files if f.get("name", "").startswith(BACKUP_TITLE_PREFIX)]
+        backups.sort(key=lambda f: f.get("createdTime", ""), reverse=True)
+        return backups
+    except Exception:
+        return []
+
 
 # ─── File paths ───────────────────────────────────────────────────────────────
 USERS_FILE = Path("users.json")
@@ -213,6 +260,8 @@ def load_reference_db() -> pd.DataFrame:
 
 def save_reference_db(df: pd.DataFrame):
     """Overwrite the Google Sheet with the reference table."""
+    # Best-effort daily safety snapshot, taken before we overwrite anything.
+    backup_spreadsheet_if_due()
     try:
         df = df.copy().fillna("")
         df["SKU"]                    = df["SKU"].apply(clean_text)
@@ -873,6 +922,39 @@ def render_admin():
                 users[me]["password"] = _hash(new_pw)
                 save_users(users)
                 st.success("Password changed successfully.")
+
+    st.markdown("---")
+    st.markdown("**Database Backups**")
+    st.caption(
+        "A full copy of the database is saved automatically, at most once per day, "
+        "right before any edit is written — named 'Customs Risk Database BACKUP YYYY-MM-DD'."
+    )
+    if st.button("Back up now"):
+        with st.spinner("Creating backup..."):
+            ok = backup_spreadsheet_if_due(force=True)
+        if ok:
+            st.success("Backup created.")
+        else:
+            st.error(
+                "Backup failed: "
+                f"{st.session_state.get('_last_backup_error', 'unknown error')}"
+            )
+        st.rerun()
+
+    backups = list_backups()
+    if backups:
+        backup_table = [
+            {"Name": b.get("name", ""), "Created": b.get("createdTime", "")[:19].replace("T", " ")}
+            for b in backups[:15]
+        ]
+        st.dataframe(pd.DataFrame(backup_table), use_container_width=True, hide_index=True)
+        if len(backups) > 15:
+            st.caption(f"...and {len(backups) - 15} older backup(s), all still kept in Drive.")
+    else:
+        st.info(
+            "No backups found yet — one is created automatically on the next save, "
+            "or click 'Back up now' above."
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
