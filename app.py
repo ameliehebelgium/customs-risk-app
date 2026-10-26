@@ -20,7 +20,7 @@ from reportlab.platypus import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-SHEET_ID   = "1_rJLgQT35aa4EeMOy0GqUZJB9d4cBZfw1uilcPBnWGM"
+SHEET_ID   = "1X6EGJDD3gmzAtR_VJF076Wlg-FuspiLsVyekGQ6fJG4"
 SHEET_NAME = "Feuille 1"   # expected tab name — used as a hint only, not load-bearing
 SHEET_GID  = None          # optional: stable numeric tab id (see .../edit#gid=NNNN in the
                            # sheet's browser URL). If set, this is tried first and survives
@@ -440,7 +440,7 @@ def pick_packing_sheet(xls) -> str:
     return names[0]                      # 3) fallback: first sheet (old behaviour)
 
 
-def normalize_document_file(uploaded_file):
+def _normalize_document_file(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     sheet = pick_packing_sheet(xls)
     raw = xls.parse(sheet, header=None, dtype=str)
@@ -571,8 +571,22 @@ def normalize_document_file(uploaded_file):
         po_number = m.group(1) if m else ""
     source_label = po_number if po_number else uploaded_file.name
 
+    # Duty rate printed in the packing list: unnamed column right of the SKU/Qty columns,
+    # numeric values between 0 and 1 (e.g. 0.060 = 6%). Detected by content, not position.
+    duty_col = None
+    if sku_col_pl is not None:
+        _cols = list(df.columns)
+        _pos = _cols.index(sku_col_pl)
+        for _c in _cols[_pos + 1:_pos + 4]:
+            _nums = pd.to_numeric(df[_c], errors="coerce").dropna()
+            _filled = df[_c].replace("", pd.NA).dropna()
+            if len(_nums) > 0 and len(_nums) >= 0.5 * len(_filled) and (_nums >= 0).all() and (_nums < 1).all():
+                duty_col = _c
+                break
+
     result = pd.DataFrame({
         "Line No":             range(1, len(df) + 1),
+        "Duty Rate":           df[duty_col].apply(format_duty_rate).values if duty_col else "",
         "Product Description": df[product_col].apply(clean_text).values,
         "HS Code":             df[hs_col].apply(clean_hs).values,
         "Qty":                 df[qty_col].apply(clean_text).values if qty_col else "",
@@ -591,7 +605,14 @@ def normalize_document_file(uploaded_file):
         result["Current Container"] = fallback_container
 
     result = result[(result["Product Description"] != "") & (result["HS Code"] != "")]
-    return result[DOC_COLUMNS]
+    return result[DOC_COLUMNS + ["Duty Rate"]]
+
+
+def normalize_document_file(uploaded_file):
+    d = _normalize_document_file(uploaded_file)
+    if "Duty Rate" not in d.columns:
+        d["Duty Rate"] = ""
+    return d
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -632,8 +653,17 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
         ref_hs_bad = hs_len_abnormal(ref_hs)
 
         # ── Determine mismatches ──
-        hs_mismatch   = bool(pl_hs and ref_hs and pl_hs != ref_hs)
-        desc_mismatch = bool(pl_desc and ref_desc and pl_desc != ref_desc)
+        pl_duty = format_duty_rate(doc_row.get("Duty Rate", ""))
+        _norm = lambda s: " ".join(str(s).split()).upper()
+        def _state(a, b):
+            if not a or not b:
+                return "na"
+            return "ok" if a == b else "diff"
+        cmp_hs   = _state(pl_hs, ref_hs)
+        cmp_desc = _state(_norm(pl_desc), _norm(ref_desc))
+        cmp_duty = _state(pl_duty, ref_duty)
+        hs_mismatch   = cmp_hs == "diff"
+        desc_mismatch = cmp_desc == "diff"
 
         if ref_hs_bad:
             # The reference HS itself is not a 10-digit code, so it cannot be
@@ -705,6 +735,10 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
             "Ref Description":    ref.get("Corrected DESCRIPTION", ""),
             "Ref HS Code":        ref_hs,
             "Ref Duty Rate":      ref_duty,
+            "PL Duty Rate":       pl_duty,
+            "Cmp HS":             cmp_hs,
+            "Cmp Desc":           cmp_desc,
+            "Cmp Duty":           cmp_duty,
             "Ref Status":         status,
         })
 
@@ -714,6 +748,75 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
 # ════════════════════════════════════════════════════════════════════════════════
 # PDF EXPORT
 # ════════════════════════════════════════════════════════════════════════════════
+
+def build_card_html(row, border: str, bg: str, icon: str) -> str:
+    """Side-by-side comparison card: DATABASE (left) vs PACKING LIST (right), one aligned
+    row per field. Differences are highlighted in red, matches in green."""
+    import html as _h
+
+    def _v(val):
+        s = str(val).strip() if val is not None else ""
+        return _h.escape(s) if s and s.lower() not in ("nan", "none", "") else "—"
+
+    def _cells(ref_val, pl_val, state):
+        if state == "diff":
+            cell = "background:#fdecea; color:#c0392b; font-weight:700;"
+            res = '<span style="color:#c0392b; font-weight:700;">≠ DIFF</span>'
+        elif state == "ok":
+            cell = "color:#1a6e3c; font-weight:600;"
+            res = '<span style="color:#1a6e3c; font-weight:700;">✓</span>'
+        else:
+            cell = "color:#333; font-weight:600;"
+            res = '<span style="color:#999;">—</span>'
+        pad = "padding:7px 10px; border-bottom:1px solid #eee; word-break:break-word;"
+        return (f'<div style="{pad}{cell}">{_v(ref_val)}</div>'
+                f'<div style="{pad}{cell}">{_v(pl_val)}</div>'
+                f'<div style="{pad}text-align:center;">{res}</div>')
+
+    def _label(text):
+        return ('<div style="padding:7px 10px; border-bottom:1px solid #eee; color:#666;'
+                f' font-size:0.85rem;">{text}</div>')
+
+    hd = "padding:8px 10px; font-weight:700; font-size:0.9rem; border-bottom:2px solid #ddd;"
+    grid = (
+        '<div style="display:grid; grid-template-columns:100px 1fr 1fr 70px; background:white;'
+        ' border:1px solid #ddd; border-radius:8px; overflow:hidden; font-size:0.9rem;">'
+        f'<div style="{hd}"></div>'
+        f'<div style="{hd} color:#1a6e3c;">✅ DATABASE (reference)</div>'
+        f'<div style="{hd} color:#1a3c6e;">📦 PACKING LIST</div>'
+        f'<div style="{hd} text-align:center;"></div>'
+        + _label("SKU")         + _cells(row.get("SKU"),             row.get("SKU"),           "ok")
+        + _label("Description") + _cells(row.get("Ref Description"), row.get("PL Description"), row.get("Cmp Desc", "na"))
+        + _label("HS Code")     + _cells(row.get("Ref HS Code"),     row.get("PL HS Code"),     row.get("Cmp HS", "na"))
+        + _label("Duty Rate")   + _cells(row.get("Ref Duty Rate"),   row.get("PL Duty Rate"),   row.get("Cmp Duty", "na"))
+        + '</div>'
+    )
+
+    ref_status = {
+        "confirmed": "✅ Confirmed", "hs_only": "🟡 HS only — pending desc",
+        "desc_only": "🟡 Desc only — pending HS", "empty": "⬜ Not yet processed",
+    }.get(str(row.get("Ref Status", "")), str(row.get("Ref Status", "")))
+
+    def _chip(label, val):
+        return (f'<span style="display:inline-block; margin:2px 14px 2px 0; font-size:0.82rem;">'
+                f'<span style="color:#777;">{label}:</span> <b>{_v(val)}</b></span>')
+
+    meta = (_chip("PO / Source", row.get("Source File")) + _chip("Container", row.get("Current Container"))
+            + _chip("Job", row.get("Job Number")) + _chip("Line", row.get("Line No"))
+            + _chip("Qty", row.get("Qty")) + _chip("Reference status", ref_status))
+    reason = (f'<div style="margin-top:6px; font-size:0.84rem; color:#555; font-style:italic;">'
+              f'{_v(row.get("Reason"))}</div>')
+
+    return (
+        f'<div style="border:2px solid {border}; border-radius:10px; background:{bg};'
+        f' padding:16px; margin-bottom:16px;">'
+        f'<div style="font-weight:700; font-size:1.05rem; color:{border}; margin-bottom:12px;">'
+        f'{icon} {_v(row.get("Action"))} &nbsp;|&nbsp; {_v(row.get("Message"))}</div>'
+        + grid
+        + f'<div style="margin-top:10px;">{meta}</div>' + reason
+        + '</div>'
+    )
+
 
 def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
     buf    = io.BytesIO()
@@ -810,57 +913,57 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
             ]))
             story.append(banner)
 
-            rows_left = [
-                [Paragraph("📦 PACKING LIST DATA", section_style), ""],
-                [Paragraph("PO / Source",   label_style), v(row, "Source File")],
-                [Paragraph("Container",     label_style), v(row, "Current Container")],
-                [Paragraph("Job Number",    label_style), v(row, "Job Number")],
-                [Paragraph("SKU",           label_style), v(row, "SKU")],
-                [Paragraph("Line No",       label_style), v(row, "Line No")],
-                [Paragraph("Description",   label_style), v(row, "PL Description")],
-                [Paragraph("HS Code",       label_style), v(row, "PL HS Code", red_val)],
-                [Paragraph("Qty",           label_style), v(row, "Qty")],
-            ]
-            rows_right = [
-                [Paragraph("✅ REFERENCE DATA", section_style), ""],
-                [Paragraph("Ref Status",    label_style), Paragraph(row.get("Ref Status",""), value_style)],
-                [Paragraph("SKU",           label_style), v(row, "SKU")],
-                [Paragraph("", label_style), Paragraph("", label_style)],
-                [Paragraph("", label_style), Paragraph("", label_style)],
-                [Paragraph("Description",   label_style), v(row, "Ref Description", green_val)],
-                [Paragraph("HS Code",       label_style), v(row, "Ref HS Code", green_val)],
-                [Paragraph("Duty Rate",     label_style), v(row, "Ref Duty Rate", green_val)],
-                [Paragraph("Reason",        label_style), Paragraph(str(row.get("Reason","") or "—"), cell_style)],
-            ]
+            from xml.sax.saxutils import escape as _esc
 
-            def make_inner(rows_data):
-                t = Table(rows_data, colWidths=[3*cm, 9*cm])
-                t.setStyle(TableStyle([
-                    ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#f0f4fa")),
-                    ("SPAN",          (0,0), (-1,0)),
-                    ("TOPPADDING",    (0,0), (-1,-1), 4),
-                    ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-                    ("LEFTPADDING",   (0,0), (-1,-1), 6),
-                    ("RIGHTPADDING",  (0,0), (-1,-1), 6),
-                    ("INNERGRID",     (0,1), (-1,-1), 0.3, colors.HexColor("#eeeeee")),
-                    ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
-                    ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-                ]))
-                return t
+            def _cell(val, state):
+                s = str(val if val is not None else "").strip()
+                if not s or s.lower() in ("nan", "none"):
+                    s = "—"
+                st_ = {"diff": red_val, "ok": green_val}.get(state, value_style)
+                return Paragraph(_esc(s), st_)
 
-            card = Table(
-                [[make_inner(rows_left), make_inner(rows_right)]],
-                colWidths=[12.5*cm, 12.5*cm]
-            )
-            card.setStyle(TableStyle([
-                ("LEFTPADDING",   (0,0), (-1,-1), 0),
-                ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-                ("TOPPADDING",    (0,0), (-1,-1), 0),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 0),
-                ("INNERGRID",     (0,0), (-1,-1), 4, colors.white),
+            def _res(state):
+                txt = {"diff": "DIFF", "ok": "OK"}.get(state, "—")
+                return Paragraph(txt, {"diff": red_val, "ok": green_val}.get(state, value_style))
+
+            fields = [
+                ("SKU",         row.get("SKU"),             row.get("SKU"),            "ok"),
+                ("Description", row.get("Ref Description"), row.get("PL Description"), row.get("Cmp Desc", "na")),
+                ("HS Code",     row.get("Ref HS Code"),     row.get("PL HS Code"),     row.get("Cmp HS", "na")),
+                ("Duty Rate",   row.get("Ref Duty Rate"),   row.get("PL Duty Rate"),   row.get("Cmp Duty", "na")),
+            ]
+            data = [[Paragraph("", label_style),
+                     Paragraph("DATABASE (reference)", section_style),
+                     Paragraph("PACKING LIST", section_style),
+                     Paragraph("", label_style)]]
+            for lab, ref_v, pl_v, state in fields:
+                data.append([Paragraph(lab, label_style), _cell(ref_v, state), _cell(pl_v, state), _res(state)])
+            card = Table(data, colWidths=[3*cm, 10.2*cm, 10.2*cm, 1.6*cm])
+            style_cmds = [
+                ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#f0f4fa")),
+                ("TOPPADDING",    (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                ("LEFTPADDING",   (0,0), (-1,-1), 6),
+                ("INNERGRID",     (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
                 ("BOX",           (0,0), (-1,-1), 1.5, border_color),
-            ]))
+                ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ]
+            for i, f in enumerate(fields, start=1):
+                if f[3] == "diff":
+                    style_cmds.append(("BACKGROUND", (1,i), (2,i), colors.HexColor("#fdecea")))
+            card.setStyle(TableStyle(style_cmds))
             story.append(card)
+            meta_txt = (
+                f"<b>PO / Source:</b> {_esc(str(row.get('Source File','') or '—'))} &nbsp; "
+                f"<b>Container:</b> {_esc(str(row.get('Current Container','') or '—'))} &nbsp; "
+                f"<b>Job:</b> {_esc(str(row.get('Job Number','') or '—'))} &nbsp; "
+                f"<b>Line:</b> {_esc(str(row.get('Line No','') or '—'))} &nbsp; "
+                f"<b>Qty:</b> {_esc(str(row.get('Qty','') or '—'))} &nbsp; "
+                f"<b>Reference status:</b> {_esc(str(row.get('Ref Status','') or '—'))}"
+            )
+            story.append(Spacer(1, 0.1*cm))
+            story.append(Paragraph(meta_txt, cell_style))
+            story.append(Paragraph(f"<b>Reason:</b> {_esc(str(row.get('Reason','') or '—'))}", cell_style))
             story.append(Spacer(1, 0.4*cm))
 
     make_card_section(red_df,    "🔴 RED — Confirmed SKU with mismatched HS or Description",
@@ -1195,75 +1298,8 @@ def main():
                             else:
                                 border, bg, icon = "#d35400", "#fff8f0", "🟠"
 
-                            def _v(val):
-                                s = str(val).strip() if val is not None else ""
-                                return s if s and s.lower() not in ("nan", "none", "") else "—"
-
-                            def _row(label, val, val_style="font-weight:600;"):
-                                return (
-                                    f'<div style="display:flex; padding:3px 0; font-size:0.85rem;'
-                                    f' border-bottom:1px solid #f0f0f0;">'
-                                    f'<div style="color:#666; min-width:120px; white-space:nowrap;">{label}</div>'
-                                    f'<div style="{val_style}">{val}</div>'
-                                    f'</div>'
-                                )
-
                             for _, row in df.iterrows():
-                                left_html = (
-                                    '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px;'
-                                    ' font-size:0.9rem;">📦 PACKING LIST</div>'
-                                    + _row("PO / Source",  _v(row.get("Source File")),
-                                           "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
-                                    + _row("Container",    _v(row.get("Current Container")))
-                                    + _row("Job Number",   _v(row.get("Job Number")))
-                                    + _row("SKU",          _v(row.get("SKU")))
-                                    + _row("Line No",      _v(row.get("Line No")))
-                                    + _row("Description",  _v(row.get("PL Description")))
-                                    + _row("HS Code",      _v(row.get("PL HS Code")),
-                                           f"font-weight:700; color:{border};")
-                                    + _row("Qty",          _v(row.get("Qty")))
-                                )
-
-                                ref_status = _v(row.get("Ref Status"))
-                                ref_status_label = {
-                                    "confirmed":  "✅ Confirmed",
-                                    "hs_only":    "🟡 HS only — pending desc",
-                                    "desc_only":  "🟡 Desc only — pending HS",
-                                    "empty":      "⬜ Not yet processed",
-                                }.get(ref_status, ref_status)
-
-                                right_html = (
-                                    '<div style="font-weight:700; color:#555; margin-bottom:8px;'
-                                    ' font-size:0.9rem;">✅ REFERENCE DATA</div>'
-                                    + _row("Status",       ref_status_label, "font-weight:600;")
-                                    + _row("SKU",          _v(row.get("SKU")))
-                                    + _row("Description",  _v(row.get("Ref Description")),
-                                           "font-weight:700; color:#1a6e3c;")
-                                    + _row("HS Code",      _v(row.get("Ref HS Code")),
-                                           "font-weight:700; color:#1a6e3c;" if color != "purple"
-                                           else "font-weight:700; color:#6c3483;")
-                                    + _row("Duty Rate",    _v(row.get("Ref Duty Rate")),
-                                           "font-weight:700; color:#1a6e3c;")
-                                    + _row("Reason",       _v(row.get("Reason")),
-                                           "color:#555; font-style:italic; font-size:0.82rem;")
-                                )
-
-                                st.markdown(f"""
-                                <div style="border:2px solid {border}; border-radius:10px;
-                                            background:{bg}; padding:16px; margin-bottom:16px;">
-                                    <div style="font-weight:700; font-size:1.05rem; color:{border}; margin-bottom:12px;">
-                                        {icon} {row.get("Action","")} &nbsp;|&nbsp; {row.get("Message","")}
-                                    </div>
-                                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
-                                        <div style="background:white; border-radius:8px; padding:12px; border:1px solid #ddd;">
-                                            {left_html}
-                                        </div>
-                                        <div style="background:white; border-radius:8px; padding:12px; border:1px solid #ddd;">
-                                            {right_html}
-                                        </div>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
+                                st.markdown(build_card_html(row, border, bg, icon), unsafe_allow_html=True)
 
                         if len(red_df) > 0:
                             st.markdown("#### 🔴 Action Required — Confirmed Mismatches")
