@@ -587,6 +587,9 @@ def _normalize_document_file(uploaded_file):
     result = pd.DataFrame({
         "Line No":             range(1, len(df) + 1),
         "Duty Rate":           df[duty_col].apply(format_duty_rate).values if duty_col else "",
+        "_HS_Row":             [header_row + 2 + i for i in range(len(df))],   # Excel row number
+        "_HS_Col":             openpyxl_col_letter(list(df.columns).index(hs_col) + 1),
+        "_Sheet":              sheet,
         "Product Description": df[product_col].apply(clean_text).values,
         "HS Code":             df[hs_col].apply(clean_hs).values,
         "Qty":                 df[qty_col].apply(clean_text).values if qty_col else "",
@@ -605,13 +608,19 @@ def _normalize_document_file(uploaded_file):
         result["Current Container"] = fallback_container
 
     result = result[(result["Product Description"] != "") & (result["HS Code"] != "")]
-    return result[DOC_COLUMNS + ["Duty Rate"]]
+    return result[DOC_COLUMNS + ["Duty Rate", "_Sheet", "_HS_Row", "_HS_Col"]]
+
+
+def openpyxl_col_letter(idx: int) -> str:
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(idx)
 
 
 def normalize_document_file(uploaded_file):
     d = _normalize_document_file(uploaded_file)
-    if "Duty Rate" not in d.columns:
-        d["Duty Rate"] = ""
+    for _c in ("Duty Rate", "_Sheet", "_HS_Row", "_HS_Col"):
+        if _c not in d.columns:
+            d[_c] = ""
     return d
 
 
@@ -736,6 +745,10 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
             "Ref HS Code":        ref_hs,
             "Ref Duty Rate":      ref_duty,
             "PL Duty Rate":       pl_duty,
+            "File Name":          doc_row.get("_File", ""),
+            "Sheet":              doc_row.get("_Sheet", ""),
+            "HS Row":             doc_row.get("_HS_Row", ""),
+            "HS Col":             doc_row.get("_HS_Col", ""),
             "Cmp HS":             cmp_hs,
             "Cmp Desc":           cmp_desc,
             "Cmp Duty":           cmp_duty,
@@ -748,6 +761,129 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
 # ════════════════════════════════════════════════════════════════════════════════
 # PDF EXPORT
 # ════════════════════════════════════════════════════════════════════════════════
+
+def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list):
+    """Write corrected HS codes into the ORIGINAL workbook and paint those cells yellow.
+
+    edits: list of (excel_row, column_letter, new_hs) — one per packing-list line.
+    Sub-SKU lines share the HS cell of their product row (merged or blank cells below it);
+    the edit goes to that product-row cell. If SKUs under one product need different HS
+    codes the cell is left untouched and reported as a conflict.
+
+    The workbook XML is patched in place (one cell value + one new style), so formulas,
+    other sheets, widths, merges and formatting are untouched.
+    Returns (new_bytes, applied, skipped); applied = [(cell, old, new, n_lines)],
+    skipped = [(cell, reason)].
+    """
+    import io, re, zipfile
+    import openpyxl
+    from xml.sax.saxutils import escape as _esc
+
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    ws = wb[sheet_name]
+
+    # 1) resolve each edit to the cell that really holds the HS value
+    targets = {}
+    for row, col, new_hs in edits:
+        coord = f"{col}{int(row)}"
+        for mr in ws.merged_cells.ranges:
+            if coord in mr:
+                coord = mr.start_cell.coordinate
+                break
+        else:
+            r = int(row)
+            while r > 1 and ws[f"{col}{r}"].value in (None, ""):
+                r -= 1
+            coord = f"{col}{r}"
+        targets.setdefault(coord, []).append(clean_hs(new_hs))
+
+    applied, skipped, todo = [], [], {}
+    for coord, vals in targets.items():
+        old = clean_hs(ws[coord].value)
+        if len(set(vals)) > 1:
+            skipped.append((coord, "SKUs under this product need different HS codes: " + ", ".join(sorted(set(vals)))))
+        elif vals[0] == old:
+            skipped.append((coord, "already has this HS"))
+        elif not vals[0]:
+            skipped.append((coord, "no new HS"))
+        else:
+            todo[coord] = vals[0]
+            applied.append((coord, old, vals[0], len(vals)))
+
+    if not todo:
+        return file_bytes, applied, skipped
+
+    # 2) patch the XML
+    zin = zipfile.ZipFile(io.BytesIO(file_bytes))
+    names = zin.namelist()
+    wbxml = zin.read("xl/workbook.xml").decode("utf-8")
+    rels  = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    m = None
+    for sm in re.finditer(r"<sheet\b[^>]*>", wbxml):
+        tag = sm.group(0)
+        nm = re.search(r'\bname="([^"]*)"', tag)
+        if nm and nm.group(1).replace("&amp;", "&") == sheet_name:
+            m = tag
+            break
+    if m is None:
+        raise RuntimeError(f"sheet '{sheet_name}' not found in workbook.xml")
+    rid = re.search(r'r:id="([^"]+)"', m).group(1)
+    target = None
+    for rm in re.finditer(r"<Relationship\b[^>]*>", rels):
+        if f'Id="{rid}"' in rm.group(0):
+            target = re.search(r'Target="([^"]+)"', rm.group(0)).group(1)
+    sheet_path = target.lstrip("/") if target.startswith("/") else "xl/" + target
+    sheet_xml = zin.read(sheet_path).decode("utf-8")
+    styles_xml = zin.read("xl/styles.xml").decode("utf-8")
+
+    # yellow fill + a clone of each affected cell style with that fill
+    fm = re.search(r'<fills count="(\d+)">(.*?)</fills>', styles_xml, re.S)
+    fill_id = int(fm.group(1))
+    new_fill = '<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill>'
+    styles_xml = styles_xml.replace(fm.group(0), f'<fills count="{fill_id + 1}">{fm.group(2)}{new_fill}</fills>')
+    xm = re.search(r'<cellXfs count="(\d+)">(.*?)</cellXfs>', styles_xml, re.S)
+    xfs = re.findall(r"<xf\b[^>]*?(?:/>|>.*?</xf>)", xm.group(2), re.S)
+    new_xfs, style_map = [], {}
+
+    def yellow_style(s_idx: int) -> int:
+        if s_idx not in style_map:
+            xf = xfs[s_idx]
+            head_end = xf.index(">")
+            head, rest = xf[:head_end], xf[head_end:]
+            head = re.sub(r'\sfillId="\d+"', "", head)
+            head = re.sub(r'\sapplyFill="\d+"', "", head)
+            head = head.replace("<xf", f'<xf fillId="{fill_id}" applyFill="1"', 1)
+            if rest.startswith("/>") is False and head.endswith("/"):
+                head = head[:-1]; rest = "/" + rest
+            new_xfs.append(head + rest)
+            style_map[s_idx] = len(xfs) + len(new_xfs) - 1
+        return style_map[s_idx]
+
+    for coord, new_hs in todo.items():
+        cm = re.search(r'<c r="' + coord + r'"([^>]*?)(/>|>.*?</c>)', sheet_xml, re.S)
+        if cm is None:
+            raise RuntimeError(f"cell {coord} not found in sheet XML")
+        attrs = cm.group(1)
+        sm_ = re.search(r'\bs="(\d+)"', attrs)
+        s_new = yellow_style(int(sm_.group(1)) if sm_ else 0)
+        cell = f'<c r="{coord}" s="{s_new}" t="inlineStr"><is><t>{_esc(new_hs)}</t></is></c>'
+        sheet_xml = sheet_xml[:cm.start()] + cell + sheet_xml[cm.end():]
+
+    styles_xml = styles_xml.replace(
+        xm.group(0),
+        f'<cellXfs count="{len(xfs) + len(new_xfs)}">{xm.group(2)}{"".join(new_xfs)}</cellXfs>')
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == sheet_path:
+                data = sheet_xml.encode("utf-8")
+            elif item.filename == "xl/styles.xml":
+                data = styles_xml.encode("utf-8")
+            zout.writestr(item, data)
+    return out.getvalue(), applied, skipped
+
 
 def build_card_html(row, border: str, bg: str, icon: str) -> str:
     """Side-by-side comparison card: DATABASE (left) vs PACKING LIST (right), one aligned
@@ -1249,8 +1385,11 @@ def main():
 
         if doc_files:
             all_doc_rows = []
+            file_bytes = {}
             for file in doc_files:
+                file_bytes[file.name] = file.getvalue()
                 doc_df = normalize_document_file(file)
+                doc_df["_File"] = file.name
                 try:
                     _xls = pd.ExcelFile(file)
                     if len(_xls.sheet_names) > 1:
@@ -1328,6 +1467,60 @@ def main():
                             type="primary",
                             use_container_width=False,
                         )
+
+                        # ── Corrected packing list: HS taken from the reference, changed cells yellow ──
+                        st.markdown("---")
+                        st.markdown("#### ✏️ Corrected Packing List")
+                        st.caption("Replaces the HS in the packing list with the reference HS and marks each changed cell "
+                                   "yellow. Everything else in the file stays as it was. Untick lines you do not want to change.")
+                        fix_df = check_df[(check_df["Cmp HS"] == "diff") & (check_df["Severity"] != "HSLEN")]
+                        fix_df = fix_df[fix_df["HS Row"].astype(str) != ""]
+                        if len(fix_df) == 0:
+                            st.info("No HS differences that can be corrected automatically.")
+                        for fname in fix_df["File Name"].unique() if len(fix_df) else []:
+                            sub = fix_df[fix_df["File Name"] == fname].reset_index(drop=True)
+                            st.markdown(f"**{fname}** — {len(sub)} line(s) with a different HS")
+                            table = pd.DataFrame({
+                                "Apply":                  True,
+                                "Line":                   sub["Line No"].values,
+                                "SKU":                    sub["SKU"].values,
+                                "Description":            sub["PL Description"].values,
+                                "HS in packing list":     sub["PL HS Code"].values,
+                                "HS in reference (new)":  sub["Ref HS Code"].values,
+                                "Duty (ref)":             sub["Ref Duty Rate"].values,
+                            })
+                            edited_fix = st.data_editor(
+                                table, hide_index=True, use_container_width=True, key=f"fix_{fname}",
+                                disabled=[c for c in table.columns if c != "Apply"],
+                            )
+                            chosen = sub[edited_fix["Apply"].values]
+                            if len(chosen) == 0:
+                                st.caption("No line selected.")
+                                continue
+                            try:
+                                new_bytes, applied, skipped = apply_hs_corrections(
+                                    file_bytes[fname], chosen.iloc[0]["Sheet"],
+                                    [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()],
+                                )
+                            except Exception as e:
+                                st.error(f"Could not edit {fname}: {e}")
+                                continue
+                            if applied:
+                                st.caption("Changed cells: " + ", ".join(f"{c} ({o} → {n})" for c, o, n, _ in applied))
+                            for cell, why in skipped:
+                                st.warning(f"Cell {cell} left unchanged — {why}")
+                            if len(pd.ExcelFile(io.BytesIO(file_bytes[fname])).sheet_names) > 1:
+                                st.caption(f"Only the '{chosen.iloc[0]['Sheet']}' sheet is changed; other sheets in this workbook "
+                                           "(e.g. invoice, contract) are not modified.")
+                            if applied:
+                                stem = fname.rsplit(".", 1)[0]
+                                st.download_button(
+                                    label=f"⬇️ Download corrected packing list — {fname}",
+                                    data=new_bytes,
+                                    file_name=f"{stem}_HS_corrected.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_fix_{fname}",
+                                )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
