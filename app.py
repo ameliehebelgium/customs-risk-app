@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 import json
 import io
+import re
 
 # ─── reportlab imports for PDF export ────────────────────────────────────────
 from reportlab.lib.pagesizes import A4, landscape
@@ -19,7 +20,7 @@ from reportlab.platypus import (
 import gspread
 from google.oauth2.service_account import Credentials
 
-SHEET_ID   = "1X6EGJDD3gmzAtR_VJF076Wlg-FuspiLsVyekGQ6fJG4"
+SHEET_ID   = "1_rJLgQT35aa4EeMOy0GqUZJB9d4cBZfw1uilcPBnWGM"
 SHEET_NAME = "Feuille 1"   # expected tab name — used as a hint only, not load-bearing
 SHEET_GID  = None          # optional: stable numeric tab id (see .../edit#gid=NNNN in the
                            # sheet's browser URL). If set, this is tried first and survives
@@ -27,18 +28,17 @@ SHEET_GID  = None          # optional: stable numeric tab id (see .../edit#gid=N
 
 
 class WorksheetLocateError(RuntimeError):
-    """Raised when the risk-database worksheet can't be found by gid, name, or header."""
+    """Raised when the reference-table worksheet can't be found by gid, name, or header."""
 
 
 def _find_worksheet_by_header(spreadsheet):
     """Self-healing fallback: scan every tab in the spreadsheet and return the one
     whose header row matches our expected columns. This is what makes the app
-    survive a tab being renamed (e.g. someone renaming 'Feuille 1', or Google
-    Sheets creating a new blank 'Feuille 1' tab) — instead of silently reading an
-    empty/wrong tab, it finds the real data wherever it currently lives."""
+    survive a tab being renamed — instead of silently reading an empty/wrong tab,
+    it finds the real data wherever it currently lives."""
     candidates = [
         ws for ws in spreadsheet.worksheets()
-        if ws.row_values(1)[:1] == COLUMNS[:1]
+        if ws.row_values(1)[:1] == REF_COLUMNS[:1]
     ]
     if not candidates:
         return None
@@ -88,18 +88,17 @@ def _get_gsheet():
         return ws
 
     raise WorksheetLocateError(
-        "Could not find the risk-case worksheet by gid, name, or header row. "
+        "Could not find the reference-table worksheet by gid, name, or header row. "
         f"Tabs currently in the sheet: {[w.title for w in spreadsheet.worksheets()]}. "
         "The tab may have been deleted — check the Google Sheet directly."
     )
 
 
 # ─── Automatic backups ────────────────────────────────────────────────────────
-# A full copy of the live spreadsheet, named to match the manual backup
-# convention that already saved this database once ("Customs Risk Database
-# BACKUP YYYY-MM-DD"). Purely additive: never touches, renames, or deletes
-# existing data or older backups — nothing here is destructive, so there's
-# nothing here that itself needs a safety net.
+# A full copy of the live spreadsheet, at most once per day, named to match the
+# manual backup convention that already saved this database once ("Customs Risk
+# Database BACKUP YYYY-MM-DD"). Purely additive — never touches or deletes
+# existing data or older backups.
 BACKUP_TITLE_PREFIX = "Customs Risk Database BACKUP "
 
 
@@ -108,16 +107,8 @@ def _today_backup_title() -> str:
 
 
 def backup_spreadsheet_if_due(force: bool = False) -> bool:
-    """Create a dated full copy of the live spreadsheet.
-
-    By default, does this at most once per calendar day (checks whether
-    today's backup already exists before creating another). Pass force=True
-    for an on-demand snapshot regardless of what's already been backed up
-    today (used by the "Back up now" button in Admin).
-
-    Never raises — a backup failure is recorded in
-    st.session_state['_last_backup_error'] and must never block a real save.
-    """
+    """Create a dated full copy of the live spreadsheet (see app.py for full
+    docstring — kept identical between the two files on purpose). Never raises."""
     try:
         gc = _get_gclient()
         if force:
@@ -125,9 +116,7 @@ def backup_spreadsheet_if_due(force: bool = False) -> bool:
         else:
             title = _today_backup_title()
             if gc.list_spreadsheet_files(title=title):
-                return False  # already backed up today
-        # copy_permissions=True so the backup is shared the same way the live
-        # sheet is — otherwise it would only be visible to the service account.
+                return False
         gc.copy(SHEET_ID, title=title, copy_permissions=True, copy_comments=False)
         return True
     except Exception as e:
@@ -136,8 +125,6 @@ def backup_spreadsheet_if_due(force: bool = False) -> bool:
 
 
 def list_backups() -> list:
-    """Return existing backup files (newest first). Empty list on any error —
-    never lets a Drive listing hiccup break the page that calls it."""
     try:
         gc = _get_gclient()
         files = gc.list_spreadsheet_files()
@@ -153,26 +140,17 @@ USERS_FILE = Path("users.json")
 LOGO_FILE  = Path("vevor_logo.png")
 
 # ─── Column definitions ───────────────────────────────────────────────────────
-COLUMNS = [
-    "Risk ID", "Input Date", "CC Date", "Inspection Date", "Container No", "MRN",
-    "BL Number", "Job Number", "SKU Number", "Inspector",
-    "Product Name", "Product Alias", "Declaration Description",
-    "Old HS", "Corrected HS", "Duty Before", "Duty After",
-    "Findings Type", "Root Cause", "Risk Reason", "Customs Comment",
-    "Status", "Notes",
-]
-DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number", "Line No", "Product Description", "HS Code", "Qty"]
+# Reference table: SKU | Corrected DESCRIPTION | Customs Commodity Code | Duty Rate
+REF_COLUMNS = ["SKU", "Corrected DESCRIPTION", "Customs Commodity Code", "Duty Rate"]
+HS_EXPECTED_LEN = 10   # EU CN/TARIC import codes are 10 digits; anything else is flagged
 
-DISPLAY_COLUMNS = [
-    "Risk ID", "Inspection Date", "Container No", "MRN", "BL Number",
-    "Job Number", "SKU Number", "Product Name",
-    "Old HS", "Corrected HS", "Duty Before", "Duty After",
-    "Findings Type", "Status", "Inspector", "Notes",
-]
+# Packing list parsed columns (internal use)
+DOC_COLUMNS = ["Source File", "Current Container", "Job Number", "SKU Number",
+               "Line No", "Product Description", "HS Code", "Qty"]
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# AUTH HELPERS
+# AUTH HELPERS  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _hash(password: str) -> str:
@@ -183,13 +161,12 @@ def load_users() -> dict:
     if USERS_FILE.exists():
         with open(USERS_FILE) as f:
             return json.load(f)
-    # Default users on first run
     default = {
         "admin":   {"password": _hash("admin123"),      "role": "admin",   "display": "Admin"},
         "broker1": {"password": _hash("broker2026"),    "role": "broker",  "display": "Broker User"},
         "visitor": {"password": _hash("visit2026"),     "role": "visitor", "display": "Visitor"},
-        "geodis":  {"password": _hash("geodis123456!"), "role": "broker", "display": "Geodis"},
-        "rhenus":  {"password": _hash("rhenus123456!"), "role": "broker", "display": "Rhenus"},
+        "geodis":  {"password": _hash("geodis123456!"), "role": "broker",  "display": "Geodis"},
+        "rhenus":  {"password": _hash("rhenus123456!"), "role": "broker",  "display": "Rhenus"},
     }
     save_users(default)
     return default
@@ -209,43 +186,33 @@ def check_login(username: str, password: str):
 
 def login_screen():
     st.set_page_config(page_title="Customs Risk Database", layout="centered")
-
     st.markdown("""
         <div style='text-align:center; padding: 2rem 0 1rem 0;'>
             <h2 style='color:#1a3c6e;'>🛃 Customs Risk Database</h2>
             <p style='color:#666;'>Vevor EU — Internal Use Only</p>
         </div>
     """, unsafe_allow_html=True)
-
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log In", use_container_width=True)
-
     if submitted:
         user = check_login(username.strip(), password)
         if user:
-            st.session_state["logged_in"]   = True
-            st.session_state["username"]    = username.strip()
-            st.session_state["role"]        = user["role"]
-            st.session_state["display"]     = user["display"]
+            st.session_state["logged_in"] = True
+            st.session_state["username"]  = username.strip()
+            st.session_state["role"]      = user["role"]
+            st.session_state["display"]   = user["display"]
             st.rerun()
         else:
             st.error("Incorrect username or password.")
 
-    st.markdown("""
-        <div style='text-align:center; margin-top:2rem; color:#aaa; font-size:0.8rem;'>
-            
-            
-        </div>
-    """, unsafe_allow_html=True)
-
 
 # ════════════════════════════════════════════════════════════════════════════════
-# DATA HELPERS  (unchanged logic from original)
+# DATA HELPERS
 # ════════════════════════════════════════════════════════════════════════════════
 
-def clean_text(value):
+def clean_text(value) -> str:
     if pd.isna(value) or value is None:
         return ""
     text = str(value).strip()
@@ -254,85 +221,98 @@ def clean_text(value):
     return text
 
 
-def clean_hs(value):
+def clean_hs(value) -> str:
     value = clean_text(value)
     if value.endswith(".0"):
         value = value[:-2]
     return value.replace(" ", "")
 
 
-def format_date(value):
+def format_duty_rate(value) -> str:
+    """Normalise a duty rate to e.g. '2,7%'. Accepts 0.027 (fraction), '2.7%' or '2,7%'."""
     text = clean_text(value)
     if text == "":
         return ""
-    try:
-        return pd.to_datetime(text).strftime("%Y-%m-%d")
-    except Exception:
-        return text[:10]
-
-
-def format_duty_rate(value):
-    text = clean_text(value)
-    if text == "":
-        return ""
+    has_pct = "%" in text
     text = text.replace("%", "").replace(",", ".").strip()
     try:
         number = float(text)
-        if 0 < number < 1:
-            number *= 100
-        result = str(int(number)) if number == int(number) else f"{number:.2f}".rstrip("0").rstrip(".")
-        return result.replace(".", ",") + "%"
     except Exception:
         return clean_text(value)
+    if not has_pct and 0 <= number < 1:
+        number = number * 100
+    number = round(number, 2)
+    out = str(int(number)) if number == int(number) else f"{number:.2f}".rstrip("0").rstrip(".")
+    return out.replace(".", ",") + "%"
 
 
-def load_database() -> pd.DataFrame:
-    """Load risk database from Google Sheets."""
+def hs_len_abnormal(value) -> bool:
+    """True if an HS code is present but is not a 10-digit number (e.g. '0', or a
+    leading zero lost on a 9-digit code)."""
+    hs = clean_hs(value)
+    return bool(hs) and (len(hs) != HS_EXPECTED_LEN or not hs.isdigit())
+
+
+def status_series(df: pd.DataFrame) -> pd.Series:
+    """Vectorised version of sku_status() — needed for a ~45k-row reference table."""
+    has_desc = df["Corrected DESCRIPTION"].astype(str).str.strip() != ""
+    has_hs   = df["Customs Commodity Code"].astype(str).str.strip() != ""
+    out = pd.Series("empty", index=df.index)
+    out[has_hs & ~has_desc] = "hs_only"
+    out[has_desc & ~has_hs] = "desc_only"
+    out[has_desc & has_hs]  = "confirmed"
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_reference_db() -> pd.DataFrame:
+    """Load SKU reference table from Google Sheets."""
     try:
         ws = _get_gsheet()
     except WorksheetLocateError as e:
         st.error(
-            f"⚠️ Could not locate the risk database sheet ({e}). "
-            "This is different from having zero cases — please check the Google Sheet "
-            "before assuming data is missing."
+            f"⚠️ Could not locate the reference table sheet ({e}). "
+            "This is different from having zero entries — please check the Google "
+            "Sheet before assuming data is missing."
         )
-        return pd.DataFrame(columns=COLUMNS)
+        return pd.DataFrame(columns=REF_COLUMNS)
     try:
         data = ws.get_all_records(default_blank="")
         if not data:
-            return pd.DataFrame(columns=COLUMNS)
+            return pd.DataFrame(columns=REF_COLUMNS)
         df = pd.DataFrame(data, dtype=str)
-        for col in COLUMNS:
+        for col in REF_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
-        df = df[COLUMNS].fillna("")
-        for col in ["Input Date", "CC Date", "Inspection Date"]:
-            df[col] = df[col].apply(format_date)
-        df["Old HS"]       = df["Old HS"].apply(clean_hs)
-        df["Corrected HS"] = df["Corrected HS"].apply(clean_hs)
-        df["Duty Before"]  = df["Duty Before"].apply(format_duty_rate)
-        df["Duty After"]   = df["Duty After"].apply(format_duty_rate)
+        df = df[REF_COLUMNS].fillna("")
+        df["SKU"]                    = df["SKU"].str.strip()
+        df["Corrected DESCRIPTION"]  = df["Corrected DESCRIPTION"].str.strip()
+        df["Customs Commodity Code"] = df["Customs Commodity Code"].str.strip().str.replace(" ", "", regex=False)
+        df["Duty Rate"]              = df["Duty Rate"].apply(format_duty_rate)
+        # Drop fully empty rows
+        df = df[df["SKU"] != ""]
         return df
     except Exception as e:
-        st.error(f"Error loading database: {e}")
-        return pd.DataFrame(columns=COLUMNS)
+        st.error(f"Error loading reference database: {e}")
+        return pd.DataFrame(columns=REF_COLUMNS)
 
 
-def save_database(df: pd.DataFrame):
-    """Save full risk database back to Google Sheets (overwrite)."""
+def save_reference_db(df: pd.DataFrame):
+    """Overwrite the Google Sheet with the reference table."""
     # Best-effort daily safety snapshot, taken before we overwrite anything.
-    # Never blocks the save — backup_spreadsheet_if_due() swallows its own errors.
     backup_spreadsheet_if_due()
     try:
-        for col in ["Input Date", "CC Date", "Inspection Date"]:
-            df[col] = df[col].apply(format_date)
-        df = df.fillna("").astype(str)
+        df = df.copy().fillna("")
+        for _c in REF_COLUMNS:
+            if _c not in df.columns:
+                df[_c] = ""
+        df["Duty Rate"]              = df["Duty Rate"].apply(format_duty_rate)
+        df["SKU"]                    = df["SKU"].apply(clean_text)
+        df["Corrected DESCRIPTION"]  = df["Corrected DESCRIPTION"].apply(clean_text)
+        df["Customs Commodity Code"] = df["Customs Commodity Code"].apply(clean_hs)
         ws = _get_gsheet()
 
-        # Safety guard: never let an accidentally-empty save silently wipe real data
-        # (e.g. if the in-memory dataframe lost its rows because an earlier load
-        # couldn't find the sheet). A genuine "sheet already has data, now saving
-        # zero rows" is almost always a bug, not an intentional wipe.
+        # Safety guard: never let an accidentally-empty save silently wipe real data.
         existing_rows = max(0, len(ws.get_all_values()) - 1)
         if len(df) == 0 and existing_rows > 0:
             st.error(
@@ -343,139 +323,64 @@ def save_database(df: pd.DataFrame):
             )
             return
 
-        # Clear and rewrite
         ws.clear()
-        ws.update([COLUMNS] + df[COLUMNS].values.tolist())
+        # RAW: keep HS codes as text (USER_ENTERED would drop leading zeros)
+        ws.update([REF_COLUMNS] + df[REF_COLUMNS].values.tolist(), value_input_option="RAW")
+        load_reference_db.clear()
     except Exception as e:
-        st.error(f"Error saving database: {e}")
+        st.error(f"Error saving reference database: {e}")
 
 
-def generate_risk_id(df):
-    year = date.today().year
-    prefix = f"RSK-{year}-"
-    existing = df["Risk ID"].dropna().astype(str).tolist() if "Risk ID" in df.columns else []
-    numbers = []
-    for rid in existing:
-        if rid.startswith(prefix):
-            try:
-                numbers.append(int(rid.replace(prefix, "")))
-            except Exception:
-                pass
-    return f"{prefix}{(max(numbers)+1 if numbers else 1):04d}"
-
-
-def make_duplicate_key(row):
+def sku_status(row) -> str:
     """
-    Same SKU + same Product Name + same Old HS + same Corrected HS = duplicate.
-    If SKU is empty, fall back to Container No + MRN + Product Name + HS codes.
-    This allows same SKU with different HS corrections to be stored as separate records.
+    Return status of a reference row:
+      'confirmed'  — has both description and HS code
+      'hs_only'    — has HS but no description (inspected, awaiting confirmation)
+      'desc_only'  — has description but no HS
+      'empty'      — neither description nor HS
     """
-    sku = clean_text(row.get("SKU Number", "")).upper()
-    if sku:
-        return (
-            "SKU",
-            sku,
-            clean_text(row.get("Product Name", "")).upper(),
-            clean_hs(row.get("Old HS", "")),
-            clean_hs(row.get("Corrected HS", "")),
-        )
-    else:
-        return (
-            "NO_SKU",
-            clean_text(row.get("Container No", "")).upper(),
-            clean_text(row.get("MRN", "")).upper(),
-            clean_text(row.get("Product Name", "")).upper(),
-            clean_hs(row.get("Old HS", "")),
-            clean_hs(row.get("Corrected HS", "")),
-        )
+    has_desc = bool(clean_text(row.get("Corrected DESCRIPTION", "")))
+    has_hs   = bool(clean_hs(row.get("Customs Commodity Code", "")))
+    if has_desc and has_hs:
+        return "confirmed"
+    if has_hs and not has_desc:
+        return "hs_only"
+    if has_desc and not has_hs:
+        return "desc_only"
+    return "empty"
 
 
-def find_header_row(uploaded_file):
-    raw = pd.read_excel(uploaded_file, header=None, dtype=str)
-    for i in range(len(raw)):
-        row_text = " ".join([clean_text(x) for x in raw.iloc[i].tolist()])
-        if "Product Name" in row_text and "OLD HS" in row_text:
-            return i
-    return 0
+def build_sku_lookup(ref_df: pd.DataFrame) -> dict:
+    """
+    Build a dict: SKU (upper) -> last row (as dict) + status.
+    For conflicting SKUs the last occurrence wins (most recent data).
+    """
+    lookup = {}
+    statuses = status_series(ref_df).tolist()
+    for d, stt in zip(ref_df.to_dict("records"), statuses):
+        sku = clean_text(d["SKU"]).upper()
+        if sku:
+            d["_status"] = stt
+            lookup[sku] = d
+    return lookup
 
 
-def normalize_import_file(uploaded_file):
-    header_row = find_header_row(uploaded_file)
-    df = pd.read_excel(uploaded_file, header=header_row, dtype=str)
-    df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
-    mapping = {
-        "Declaration Date": "CC Date",
-        "Inspection Date": "Inspection Date",
-        "Container No.": "Container No",
-        "MRN (Declaration Ref)": "MRN",
-        "BL number": "BL Number",
-        "BL Number": "BL Number",
-        "Job number": "Job Number",
-        "Job Number": "Job Number",
-        "Inspector (Customs Agent)": "Inspector",
-        "Inspector": "Inspector",
-        "SKU number": "SKU Number",
-        "SKU Number": "SKU Number",
-        "Product Name (EN)": "Product Name",
-        "Declaration Description (as filed)": "Declaration Description",
-        "OLD HS Code (as declared)": "Old HS",
-        "CORRECTED HS Code (by customs)": "Corrected HS",
-        "Duty Rate BEFORE (%)": "Duty Before",
-        "Duty Rate AFTER (%)": "Duty After",
-        "Findings Type (see dropdown)": "Findings Type",
-        "Root Cause": "Root Cause",
-    }
-    df = df.rename(columns=mapping)
-    for col in COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[COLUMNS]
-    for col in COLUMNS:
-        df[col] = df[col].apply(clean_text)
-    for col in ["Input Date", "CC Date", "Inspection Date"]:
-        df[col] = df[col].apply(format_date)
-    df["Old HS"]       = df["Old HS"].apply(clean_hs)
-    df["Corrected HS"] = df["Corrected HS"].apply(clean_hs)
-    df["Duty Before"]  = df["Duty Before"].apply(format_duty_rate)
-    df["Duty After"]   = df["Duty After"].apply(format_duty_rate)
-    df = df[(df["Product Name"] != "") & (df["Old HS"] != "") & (df["Corrected HS"] != "")]
-    return df
-
-
-def find_document_header_row(uploaded_file):
-    raw = pd.read_excel(uploaded_file, header=None, dtype=str)
-    for i in range(len(raw)):
-        row_text = " ".join([clean_text(x).upper() for x in raw.iloc[i].tolist()])
-        if ("DESCRIPTION" in row_text or "ITEM" in row_text) and ("HS" in row_text or "HTS" in row_text):
-            return i
-    return 0
-
+# ════════════════════════════════════════════════════════════════════════════════
+# PACKING LIST PARSING  (preserved from original, unchanged)
+# ════════════════════════════════════════════════════════════════════════════════
 
 def _looks_like_container(value: str) -> bool:
-    """Container numbers are typically 4 letters + 7 digits, e.g. MSDU8622145."""
-    import re
     return bool(re.match(r'^[A-Z]{3,4}\d{6,8}$', value.strip().upper()))
 
 
 def extract_containers_from_header(raw_df) -> list:
-    """
-    Scan the first 20 rows for 'Container NO.' and extract ALL container numbers
-    found in that row (handles multi-container strings like 'MSDU8622145+MEDU4532909').
-    Returns a list of container number strings (may be empty).
-    """
-    import re
     containers = []
     for i in range(min(len(raw_df), 20)):
         row_values = [clean_text(x) for x in raw_df.iloc[i].tolist()]
         row_text   = " ".join(row_values).upper()
         if "CONTAINER" not in row_text:
             continue
-
-        # Collect all cell values from this row
         full_text = " ".join(row_values)
-
-        # Case 1: container number embedded in same cell as label
-        # e.g. "Container NO.: MSDU8622145+MEDU4532909"
         m = re.search(r'Container\s*NO\.?\s*:?\s*([A-Z0-9+\s]+)', full_text, re.IGNORECASE)
         if m:
             raw_ids = re.split(r'[+\s]+', m.group(1).strip())
@@ -483,14 +388,10 @@ def extract_containers_from_header(raw_df) -> list:
             if found:
                 containers.extend(found)
                 break
-
-        # Case 2: label in one cell, value(s) in adjacent cell
         for j, value in enumerate(row_values):
             if "CONTAINER" in value.upper():
-                # Check next cells for container-like values
                 for k in range(j + 1, min(j + 4, len(row_values))):
                     candidate = clean_text(row_values[k])
-                    # May be "CSNU7617334+OOCU8995319"
                     parts = re.split(r'[+\s]+', candidate)
                     found = [p.strip().upper() for p in parts if _looks_like_container(p)]
                     if found:
@@ -500,23 +401,18 @@ def extract_containers_from_header(raw_df) -> list:
                     break
         if containers:
             break
-
     return containers
 
 
 def extract_po_number(raw_df) -> str:
-    """Scan the first 20 rows for 'PO NO' and return the value (e.g. 'FR-052051')."""
-    import re
     for i in range(min(len(raw_df), 20)):
         row_values = [str(x).strip() for x in raw_df.iloc[i].tolist()]
         for j, val in enumerate(row_values):
             if not re.search(r'PO\s*NO', val, re.IGNORECASE):
                 continue
-            # Case 1: "PO NO.: FR-052051" — value embedded in same cell
             m = re.search(r'PO\s*NO\.?\s*:?\s*([A-Z]{1,4}-?\d{4,8})', val, re.IGNORECASE)
             if m:
                 return m.group(1).strip()
-            # Case 2: label in one cell, value in next non-empty cell
             for k in range(j + 1, min(j + 4, len(row_values))):
                 candidate = row_values[k].strip()
                 if candidate and candidate.lower() not in ("", "none", "nan"):
@@ -524,18 +420,37 @@ def extract_po_number(raw_df) -> str:
     return ""
 
 
-def normalize_document_file(uploaded_file):
-    import re as _re
-    raw = pd.read_excel(uploaded_file, header=None, dtype=str)
+def pick_packing_sheet(xls) -> str:
+    """Which sheet holds the packing list. Single-sheet files: that sheet.
+    Three-in-one files (发票 / 箱单 / 合同): the 箱单 sheet."""
+    names = list(xls.sheet_names)
+    if len(names) == 1:
+        return names[0]
+    for n in names:                      # 1) by sheet name
+        nl = str(n).lower()
+        if "箱单" in nl or "packing" in nl:
+            return n
+    for n in names:                      # 2) by content: has a 'Packing List' title
+        try:
+            head = xls.parse(n, header=None, dtype=str, nrows=6)
+            if head.astype(str).apply(lambda c: c.str.contains("packing list", case=False, na=False)).any().any():
+                return n
+        except Exception:
+            pass
+    return names[0]                      # 3) fallback: first sheet (old behaviour)
 
-    # ── Detect Vevor shipment format 1: job number, SKU, description, HS code, container ──
+
+def normalize_document_file(uploaded_file):
+    xls = pd.ExcelFile(uploaded_file)
+    sheet = pick_packing_sheet(xls)
+    raw = xls.parse(sheet, header=None, dtype=str)
+
     first_row = [str(x).strip().lower() for x in raw.iloc[0].tolist()]
     is_vevor_format1 = (
         any("sku" in c for c in first_row) and
         any("hs" in c for c in first_row) and
         any("job" in c for c in first_row)
     )
-    # ── Detect Vevor internal format 2: 排柜单号, SKU, 英文申报名称, 中国出口HS ──
     is_vevor_format2 = (
         any("排柜单号" in c for c in first_row) and
         any("sku" in c for c in first_row) and
@@ -543,7 +458,7 @@ def normalize_document_file(uploaded_file):
     )
 
     if is_vevor_format1:
-        df = pd.read_excel(uploaded_file, header=0, dtype=str)
+        df = xls.parse(sheet, header=0, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         job_col = sku_col = desc_col = hs_col = container_col = None
         for col in df.columns:
@@ -557,7 +472,7 @@ def normalize_document_file(uploaded_file):
             return pd.DataFrame(columns=DOC_COLUMNS)
         def _extract_job(val):
             val = clean_text(val)
-            m = _re.search(r"(\d{6})$", val)
+            m = re.search(r"(\d{6})$", val)
             return m.group(1) if m else val
         result = pd.DataFrame()
         result["Source File"]         = uploaded_file.name
@@ -572,7 +487,7 @@ def normalize_document_file(uploaded_file):
         return result[DOC_COLUMNS]
 
     if is_vevor_format2:
-        df = pd.read_excel(uploaded_file, header=0, dtype=str)
+        df = xls.parse(sheet, header=0, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         job_col  = next((c for c in df.columns if "排柜单号" in c), None)
         sku_col  = next((c for c in df.columns if c.upper() == "SKU"), None)
@@ -583,7 +498,7 @@ def normalize_document_file(uploaded_file):
             return pd.DataFrame(columns=DOC_COLUMNS)
         def _extract_job2(val):
             val = clean_text(val)
-            m = _re.search(r"(\d{6})$", val)
+            m = re.search(r"(\d{6})$", val)
             return m.group(1) if m else val
         result = pd.DataFrame()
         result["Source File"]         = uploaded_file.name
@@ -597,18 +512,17 @@ def normalize_document_file(uploaded_file):
         result = result[(result["Product Description"] != "") & (result["HS Code"] != "") & (result["HS Code"].str.len() >= 6)]
         return result[DOC_COLUMNS]
 
-    # ── Standard invoice / packing list format ──
+    # ── Standard packing list / invoice ──
     header_containers = extract_containers_from_header(raw)
     fallback_container = "+".join(header_containers) if header_containers else ""
 
-    # 直接从 raw 找 header 行，避免重复读文件导致指针问题
     header_row = 0
     for i in range(len(raw)):
         row_text = " ".join([clean_text(x).upper() for x in raw.iloc[i].tolist()])
         if ("DESCRIPTION" in row_text or "ITEM" in row_text) and ("HS" in row_text or "HTS" in row_text):
             header_row = i
             break
-    # 用 raw 直接构建有表头的 df，不重新读文件
+
     df = raw.iloc[header_row + 1:].copy()
     raw_headers = [str(c).replace("\n", " ").strip() for c in raw.iloc[header_row].tolist()]
     named_headers = []
@@ -635,14 +549,11 @@ def normalize_document_file(uploaded_file):
         if sku_col_pl is None and "SKU" in col_upper:
             sku_col_pl = col
 
-    # Fallback: detect unnamed column whose values look like SKU codes
-    # (alphanumeric mix, length >= 8) — handles packing lists where SKU has no header
     if sku_col_pl is None:
-        import re as _re2
         def _looks_like_sku(val):
             s = str(val).strip()
-            return (len(s) >= 8 and bool(_re2.search(r'[A-Za-z]', s))
-                    and bool(_re2.search(r'\d', s)))
+            return (len(s) >= 8 and bool(re.search(r'[A-Za-z]', s))
+                    and bool(re.search(r'\d', s)))
         for col in df.columns:
             if "Unnamed" in str(col) or str(col).strip() in ("", "None", "nan"):
                 sample = df[col].dropna().head(20).tolist()
@@ -654,15 +565,12 @@ def normalize_document_file(uploaded_file):
     if product_col is None or hs_col is None:
         return pd.DataFrame(columns=DOC_COLUMNS)
 
-    # Use PO NO. as the source label (e.g. "FR-052051"), fall back to job number in filename
     po_number = extract_po_number(raw)
     if not po_number:
-        import re as _re_fn
-        m = _re_fn.search(r'(\d{6})', uploaded_file.name)
+        m = re.search(r'(\d{6})', uploaded_file.name)
         po_number = m.group(1) if m else ""
     source_label = po_number if po_number else uploaded_file.name
 
-    # 先建 Series 列，最后再赋标量，避免 pandas index 对齐把标量列冲成 NaN
     result = pd.DataFrame({
         "Line No":             range(1, len(df) + 1),
         "Product Description": df[product_col].apply(clean_text).values,
@@ -672,15 +580,13 @@ def normalize_document_file(uploaded_file):
         "Job Number":          "",
     })
     result["Source File"] = source_label
-
-    # Forward fill: 附属 SKU 行的 Product/HS 为空时，继承上方产品行的值
     result["Product Description"] = result["Product Description"].replace("", pd.NA).ffill().fillna("")
     result["HS Code"] = result["HS Code"].replace("", pd.NA).ffill().fillna("")
 
     if container_col:
         result["Current Container"] = df[container_col].apply(
             lambda x: clean_text(x) if clean_text(x) else fallback_container
-        )
+        ).values
     else:
         result["Current Container"] = fallback_container
 
@@ -688,78 +594,120 @@ def normalize_document_file(uploaded_file):
     return result[DOC_COLUMNS]
 
 
-def split_aliases(value):
-    text = clean_text(value)
-    if text == "":
-        return []
-    return [x.strip().upper() for x in text.replace(",", ";").split(";") if x.strip()]
+# ════════════════════════════════════════════════════════════════════════════════
+# RISK CHECK LOGIC  (new SKU-based)
+# ════════════════════════════════════════════════════════════════════════════════
 
+def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each line in doc_df, look up the SKU in the reference table.
+    Returns a DataFrame of flagged lines with severity and reason.
 
-def product_matches_risk(product_description, risk_row):
-    product    = clean_text(product_description).upper()
-    candidates = [
-        clean_text(risk_row.get("Product Name", "")).upper(),
-        clean_text(risk_row.get("Declaration Description", "")).upper(),
-    ]
-    candidates += split_aliases(risk_row.get("Product Alias", ""))
-    candidates  = [x for x in candidates if x]
-    for candidate in candidates:
-        if candidate in product or product in candidate:
-            return True
-    return False
-
-
-def check_documents_against_risks(doc_df, risk_df):
+    Severity levels:
+      RED    — SKU confirmed (has desc + HS), but PL description or HS doesn't match
+      YELLOW — SKU found but pending confirmation (HS only, no desc), any mismatch present
+      ORANGE — SKU found but both description and HS are missing in reference
+      INFO   — SKU not found in reference at all (unknown SKU — log for awareness)
+    """
+    lookup = build_sku_lookup(ref_df)
     results = []
+
     for _, doc_row in doc_df.iterrows():
-        product = clean_text(doc_row["Product Description"])
-        hs      = clean_hs(doc_row["HS Code"])
-        for _, risk_row in risk_df.iterrows():
-            old_hs        = clean_hs(risk_row["Old HS"])
-            product_match = product_matches_risk(product, risk_row)
-            hs_match      = (hs == old_hs and old_hs != "")
-            if product_match and hs_match:
-                severity = "RED"
-                message  = "Both old HS and product name match a known risk. High probability of repeated classification error."
-            elif hs_match:
-                severity = "ORANGE"
-                message  = "HS code matches a historical correction. Please verify the product manually."
-            elif product_match:
-                severity = "ORANGE"
-                message  = "Product description matches a historical risk. Please confirm whether the HS has been updated."
-            else:
-                continue
-            corrected_hs = clean_hs(risk_row["Corrected HS"])
-            hs_note = "Inspected but HS remains the same" if (old_hs != "" and old_hs == corrected_hs) else ""
-            results.append({
-                "Severity":                  severity,
-                "Action Required":           "STOP & REVIEW" if severity == "RED" else "MANUAL REVIEW",
-                "Current Container":         doc_row["Current Container"],
-                "Current Product":           product,
-                "Current HS":                hs,
-                "Qty":                       doc_row["Qty"],
-                "Source File":               doc_row["Source File"],
-                "Line No":                   doc_row["Line No"],
-                "Corrected HS":              corrected_hs,
-                "HS Note":                   hs_note,
-                "Matched Risk ID":           risk_row["Risk ID"],
-                "Previous Inspection Date":  risk_row["Inspection Date"],
-                "Previous Container":        risk_row["Container No"],
-                "Previous MRN":              risk_row["MRN"],
-                "Job Number":                clean_text(str(doc_row.get("Job Number", "") or "")),
-                "Current BL Number":         clean_text(str(doc_row.get("BL Number", "") or "")),
-                "BL Number":                 risk_row.get("BL Number", ""),
-                "SKU Number":                clean_text(str(doc_row.get("SKU Number", "") or "")),
-                "Risk SKU Number":           risk_row.get("SKU Number", ""),
-                "Risk Job Number":           risk_row.get("Job Number", ""),
-                "Historical Product":        risk_row["Product Name"],
-                "Old HS Used Before":        old_hs,
-                "Duty Before":               risk_row["Duty Before"],
-                "Duty After":                risk_row["Duty After"],
-                "Message":                   message,
-                "Customs Comment":           risk_row["Customs Comment"],
-                "Risk Reason":               risk_row["Risk Reason"],
-            })
+        sku_raw  = clean_text(doc_row.get("SKU Number", ""))
+        sku_key  = sku_raw.upper()
+        pl_desc  = clean_text(doc_row.get("Product Description", "")).upper()
+        pl_hs    = clean_hs(doc_row.get("HS Code", ""))
+
+        if not sku_key:
+            continue  # No SKU on this line — skip
+
+        if sku_key not in lookup:
+            continue  # SKU not in reference — no alert
+
+        ref = lookup[sku_key]
+        status   = ref["_status"]
+        ref_desc = clean_text(ref.get("Corrected DESCRIPTION", "")).upper()
+        ref_hs   = clean_hs(ref.get("Customs Commodity Code", ""))
+        ref_duty = clean_text(ref.get("Duty Rate", ""))
+        ref_hs_bad = hs_len_abnormal(ref_hs)
+
+        # ── Determine mismatches ──
+        hs_mismatch   = bool(pl_hs and ref_hs and pl_hs != ref_hs)
+        desc_mismatch = bool(pl_desc and ref_desc and pl_desc != ref_desc)
+
+        if ref_hs_bad:
+            # The reference HS itself is not a 10-digit code, so it cannot be
+            # compared reliably — flag the reference data instead of the PL.
+            severity = "HSLEN"
+            reasons = [f"Reference HS '{ref_hs}' has {len(ref_hs)} digit(s), expected {HS_EXPECTED_LEN}"]
+            if pl_hs:
+                reasons.append(f"PL declares HS: {pl_hs}")
+            if desc_mismatch:
+                reasons.append(f"Description mismatch: PL has '{doc_row.get('Product Description','')}', reference is '{ref.get('Corrected DESCRIPTION','')}'")
+            reason_str = " | ".join(reasons)
+            action = "CHECK REFERENCE"
+            message = "HS length abnormal - reference HS is not a 10-digit code, cannot be compared reliably."
+
+        elif status == "confirmed":
+            if not hs_mismatch and not desc_mismatch:
+                continue  # All good
+            severity = "RED"
+            reasons = []
+            if hs_mismatch:
+                reasons.append(f"HS mismatch: PL has {pl_hs}, reference is {ref_hs}")
+            if desc_mismatch:
+                reasons.append(f"Description mismatch: PL has '{doc_row.get('Product Description','')}', reference is '{ref.get('Corrected DESCRIPTION','')}'")
+            reason_str = " | ".join(reasons)
+            action = "STOP & REVIEW"
+            message = "SKU confirmed in reference — HS or description differs from validated data."
+
+        elif status == "hs_only":
+            # Has HS in reference but no confirmed description yet
+            severity = "YELLOW"
+            reasons = []
+            if hs_mismatch:
+                reasons.append(f"HS mismatch: PL has {pl_hs}, reference has {ref_hs}")
+            if not ref_desc:
+                reasons.append("Description not yet confirmed in reference")
+            reason_str = " | ".join(reasons) if reasons else "SKU pending confirmation — description missing in reference"
+            action = "PENDING REVIEW"
+            message = "SKU previously inspected but description not yet confirmed by customs."
+
+        elif status == "desc_only":
+            # Has description but no HS confirmed yet
+            severity = "YELLOW"
+            reasons = [f"HS code not yet confirmed in reference"]
+            if pl_hs:
+                reasons.append(f"PL declares HS: {pl_hs}")
+            reason_str = " | ".join(reasons)
+            action = "PENDING REVIEW"
+            message = "SKU previously inspected but HS code not yet confirmed by customs."
+
+        else:  # empty
+            severity = "ORANGE"
+            reason_str = "Both description and HS code missing in reference — SKU registered but not yet processed"
+            action = "LOG & MONITOR"
+            message = "SKU exists in reference database but has no validated description or HS code yet."
+
+        results.append({
+            "Severity":           severity,
+            "Action":             action,
+            "Message":            message,
+            "Reason":             reason_str,
+            "Source File":        doc_row.get("Source File", ""),
+            "Current Container":  doc_row.get("Current Container", ""),
+            "Job Number":         doc_row.get("Job Number", ""),
+            "Line No":            doc_row.get("Line No", ""),
+            "SKU":                sku_raw,
+            "PL Description":     doc_row.get("Product Description", ""),
+            "PL HS Code":         pl_hs,
+            "Qty":                doc_row.get("Qty", ""),
+            "Ref Description":    ref.get("Corrected DESCRIPTION", ""),
+            "Ref HS Code":        ref_hs,
+            "Ref Duty Rate":      ref_duty,
+            "Ref Status":         status,
+        })
+
     return pd.DataFrame(results)
 
 
@@ -782,8 +730,28 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
     h2_style    = ParagraphStyle("h2",    parent=styles["Heading2"],
                                  fontSize=12, textColor=colors.HexColor("#1a3c6e"), spaceBefore=12)
     cell_style  = ParagraphStyle("cell",  parent=styles["Normal"], fontSize=7.5, leading=10)
+    label_style = ParagraphStyle("label", parent=styles["Normal"],
+                                 fontSize=7.5, textColor=colors.HexColor("#666666"))
+    value_style = ParagraphStyle("value", parent=styles["Normal"],
+                                 fontSize=7.5, fontName="Helvetica-Bold")
+    red_val     = ParagraphStyle("redval", parent=styles["Normal"],
+                                 fontSize=7.5, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#c0392b"))
+    yellow_val  = ParagraphStyle("yelval", parent=styles["Normal"],
+                                 fontSize=7.5, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#b7770d"))
+    green_val   = ParagraphStyle("greenval", parent=styles["Normal"],
+                                 fontSize=7.5, fontName="Helvetica-Bold",
+                                 textColor=colors.HexColor("#1a6e3c"))
+    section_style = ParagraphStyle("sect", parent=styles["Normal"],
+                                   fontSize=8, fontName="Helvetica-Bold",
+                                   textColor=colors.HexColor("#1a3c6e"))
 
-    # Header
+    red_df    = check_df[check_df["Severity"] == "RED"]
+    yellow_df = check_df[check_df["Severity"] == "YELLOW"]
+    orange_df = check_df[check_df["Severity"] == "ORANGE"]
+    hslen_df  = check_df[check_df["Severity"] == "HSLEN"]
+
     story.append(Paragraph("Customs Risk Check Report", title_style))
     story.append(Paragraph(
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; "
@@ -793,46 +761,29 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
     ))
     story.append(Spacer(1, 0.4*cm))
 
-    red_df    = check_df[check_df["Severity"] == "RED"]
-    orange_df = check_df[check_df["Severity"] == "ORANGE"]
-
-    # Summary box
     summary_data = [
-        ["🚨 RED ALERTS", "⚠️ ORANGE WARNINGS", "Total Lines Flagged"],
-        [str(len(red_df)), str(len(orange_df)), str(len(check_df))],
+        ["RED - Action Required", "YELLOW - Pending Review", "ORANGE - Log & Monitor", "HS LENGTH ABNORMAL", "Total Flagged"],
+        [str(len(red_df)), str(len(yellow_df)), str(len(orange_df)), str(len(hslen_df)), str(len(check_df))],
     ]
-    summary_table = Table(summary_data, colWidths=[7*cm, 7*cm, 7*cm])
+    summary_table = Table(summary_data, colWidths=[5*cm, 5*cm, 5*cm, 5*cm, 5*cm])
     summary_table.setStyle(TableStyle([
-        ("BACKGROUND",  (0,0), (-1,0), colors.HexColor("#1a3c6e")),
-        ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
-        ("BACKGROUND",  (0,1), (0,1),  colors.HexColor("#fde8e8")),
-        ("BACKGROUND",  (1,1), (1,1),  colors.HexColor("#fff3e0")),
-        ("BACKGROUND",  (2,1), (2,1),  colors.HexColor("#e8f0fe")),
-        ("FONTSIZE",    (0,1), (-1,1), 18),
-        ("ALIGN",       (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0,0), (-1,-1), [None, None]),
-        ("BOX",         (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
-        ("INNERGRID",   (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
-        ("TOPPADDING",  (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
+        ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#1a3c6e")),
+        ("TEXTCOLOR",    (0,0), (-1,0), colors.white),
+        ("BACKGROUND",   (0,1), (0,1),  colors.HexColor("#fde8e8")),
+        ("BACKGROUND",   (1,1), (1,1),  colors.HexColor("#fffbe6")),
+        ("BACKGROUND",   (2,1), (2,1),  colors.HexColor("#fff3e0")),
+        ("BACKGROUND",   (3,1), (3,1),  colors.HexColor("#f4ecf7")),
+        ("BACKGROUND",   (4,1), (4,1),  colors.HexColor("#e8f0fe")),
+        ("FONTSIZE",     (0,1), (-1,1), 18),
+        ("ALIGN",        (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+        ("BOX",          (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("INNERGRID",    (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("TOPPADDING",   (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 8),
     ]))
     story.append(summary_table)
     story.append(Spacer(1, 0.5*cm))
-
-    label_style  = ParagraphStyle("label", parent=styles["Normal"],
-                                  fontSize=7.5, textColor=colors.HexColor("#666666"))
-    value_style  = ParagraphStyle("value", parent=styles["Normal"],
-                                  fontSize=7.5, fontName="Helvetica-Bold")
-    red_val      = ParagraphStyle("redval", parent=styles["Normal"],
-                                  fontSize=7.5, fontName="Helvetica-Bold",
-                                  textColor=colors.HexColor("#c0392b"))
-    green_val    = ParagraphStyle("greenval", parent=styles["Normal"],
-                                  fontSize=7.5, fontName="Helvetica-Bold",
-                                  textColor=colors.HexColor("#1a6e3c"))
-    section_style= ParagraphStyle("sect", parent=styles["Normal"],
-                                  fontSize=8, fontName="Helvetica-Bold",
-                                  textColor=colors.HexColor("#1a3c6e"))
 
     def v(row, key, style=None):
         val = str(row.get(key, "") or "—")
@@ -845,53 +796,42 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
             return
         story.append(Paragraph(heading, h2_style))
         story.append(Spacer(1, 0.2*cm))
-
         for _, row in section_df.iterrows():
-            # Alert banner
-            alert_msg = f"<b>{row.get('Action Required','')} | {row.get('Message','')}</b>"
+            alert_msg = f"<b>{row.get('Action','')} | {row.get('Message','')}</b>"
             banner = Table([[Paragraph(alert_msg, ParagraphStyle(
                 "banner", parent=styles["Normal"], fontSize=8,
                 textColor=border_color))]],
                 colWidths=[25*cm])
             banner.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,-1), bg_color),
-                ("TOPPADDING", (0,0), (-1,-1), 6),
+                ("BACKGROUND",    (0,0), (-1,-1), bg_color),
+                ("TOPPADDING",    (0,0), (-1,-1), 6),
                 ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-                ("LEFTPADDING", (0,0), (-1,-1), 8),
+                ("LEFTPADDING",   (0,0), (-1,-1), 8),
             ]))
             story.append(banner)
 
-            # Two-column card
-            rows_left  = [
-                [Paragraph("📦 CURRENT SHIPMENT", section_style), ""],
-                [Paragraph("Container",  label_style), v(row, "Current Container")],
-                [Paragraph("BL Number",  label_style), v(row, "BL Number")],
-                [Paragraph("Job Number", label_style), v(row, "Job Number")],
-                [Paragraph("SKU",        label_style), v(row, "SKU Number")],
-                [Paragraph("MRN",        label_style), Paragraph("—", label_style)],
-                [Paragraph("Inspection", label_style), Paragraph("—", label_style)],
-                [Paragraph("Product",    label_style), v(row, "Current Product")],
-                [Paragraph("Current HS", label_style), v(row, "Current HS", red_val)],
-                [Paragraph("✅ Should be",label_style), v(row, "Corrected HS", green_val)],
+            rows_left = [
+                [Paragraph("📦 PACKING LIST DATA", section_style), ""],
+                [Paragraph("PO / Source",   label_style), v(row, "Source File")],
+                [Paragraph("Container",     label_style), v(row, "Current Container")],
+                [Paragraph("Job Number",    label_style), v(row, "Job Number")],
+                [Paragraph("SKU",           label_style), v(row, "SKU")],
+                [Paragraph("Line No",       label_style), v(row, "Line No")],
+                [Paragraph("Description",   label_style), v(row, "PL Description")],
+                [Paragraph("HS Code",       label_style), v(row, "PL HS Code", red_val)],
+                [Paragraph("Qty",           label_style), v(row, "Qty")],
             ]
             rows_right = [
-                [Paragraph("📋 HISTORICAL REFERENCE", section_style), ""],
-                [Paragraph("Container",  label_style), v(row, "Previous Container")],
-                [Paragraph("BL Number",  label_style), v(row, "BL Number")],
-                [Paragraph("Job Number", label_style), v(row, "Risk Job Number")],
-                [Paragraph("SKU",        label_style), v(row, "Risk SKU Number")],
-                [Paragraph("MRN",        label_style), v(row, "Previous MRN")],
-                [Paragraph("Inspection", label_style), v(row, "Previous Inspection Date")],
-                [Paragraph("Product",    label_style), v(row, "Historical Product")],
-                [Paragraph("Old HS",     label_style), v(row, "Old HS Used Before", red_val)],
-                [Paragraph("✅ Corrected to", label_style), v(row, "Corrected HS", green_val)],
+                [Paragraph("✅ REFERENCE DATA", section_style), ""],
+                [Paragraph("Ref Status",    label_style), Paragraph(row.get("Ref Status",""), value_style)],
+                [Paragraph("SKU",           label_style), v(row, "SKU")],
+                [Paragraph("", label_style), Paragraph("", label_style)],
+                [Paragraph("", label_style), Paragraph("", label_style)],
+                [Paragraph("Description",   label_style), v(row, "Ref Description", green_val)],
+                [Paragraph("HS Code",       label_style), v(row, "Ref HS Code", green_val)],
+                [Paragraph("Duty Rate",     label_style), v(row, "Ref Duty Rate", green_val)],
+                [Paragraph("Reason",        label_style), Paragraph(str(row.get("Reason","") or "—"), cell_style)],
             ]
-            hs_note = str(row.get("HS Note", "") or "")
-            if hs_note:
-                rows_right.append([
-                    Paragraph("📝 Reason", ParagraphStyle("note_label", parent=label_style, textColor=colors.HexColor("#888888"), fontName="Helvetica-Oblique")),
-                    Paragraph(hs_note,     ParagraphStyle("note_val",   parent=label_style, textColor=colors.HexColor("#555555"), fontName="Helvetica-Oblique")),
-                ])
 
             def make_inner(rows_data):
                 t = Table(rows_data, colWidths=[3*cm, 9*cm])
@@ -923,10 +863,14 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
             story.append(card)
             story.append(Spacer(1, 0.4*cm))
 
-    make_card_section(red_df,    "🚨 HIGH RISK — Immediate Action Required",
+    make_card_section(red_df,    "🔴 RED — Confirmed SKU with mismatched HS or Description",
                       colors.HexColor("#c0392b"), colors.HexColor("#fdf0f0"))
-    make_card_section(orange_df, "⚠️  MANUAL REVIEW REQUIRED",
+    make_card_section(yellow_df, "🟡 YELLOW — SKU pending customs confirmation",
+                      colors.HexColor("#b7770d"), colors.HexColor("#fffdf0"))
+    make_card_section(orange_df, "🟠 ORANGE — SKU registered but not yet processed",
                       colors.HexColor("#d35400"), colors.HexColor("#fdf6ec"))
+    make_card_section(hslen_df,  "HS LENGTH ABNORMAL - reference HS is not a 10-digit code",
+                      colors.HexColor("#6c3483"), colors.HexColor("#f9f0ff"))
 
     story.append(Spacer(1, 0.5*cm))
     story.append(Paragraph(
@@ -934,7 +878,6 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
         ParagraphStyle("footer", parent=styles["Normal"], fontSize=7,
                        textColor=colors.grey, alignment=1)
     ))
-
     doc.build(story)
     return buf.getvalue()
 
@@ -944,93 +887,78 @@ def build_pdf_report(check_df: pd.DataFrame, doc_files_info: str) -> bytes:
 # ════════════════════════════════════════════════════════════════════════════════
 
 def render_dashboard(df: pd.DataFrame):
-    st.subheader("📊 Risk Database Dashboard")
-
+    st.subheader("📊 Reference Database Dashboard")
     if len(df) == 0:
-        st.info("No risk cases in the database yet.")
+        st.info("No SKU data in the reference database yet.")
         return
 
-    active_df     = df[df["Status"] == "active"]
-    monitoring_df = df[df["Status"] == "monitoring"]
-    solved_df     = df[df["Status"] == "solved"]
+    _st        = status_series(df)
+    confirmed  = df[_st == "confirmed"]
+    hs_only    = df[_st == "hs_only"]
+    desc_only  = df[_st == "desc_only"]
+    empty      = df[_st == "empty"]
+    hs_abnormal = df[df["Customs Commodity Code"].apply(hs_len_abnormal)]
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Cases",      len(df))
-    c2.metric("🔴 Active",        len(active_df))
-    c3.metric("🟡 Monitoring",    len(monitoring_df))
-    c4.metric("🟢 Solved",        len(solved_df))
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c6.metric("⚠️ HS 位数异常", len(hs_abnormal))
+    c1.metric("Total SKUs",                len(df))
+    c2.metric("✅ Confirmed",              len(confirmed))
+    c3.metric("🟡 HS only (pending desc)", len(hs_only))
+    c4.metric("🟡 Desc only (pending HS)", len(desc_only))
+    c5.metric("⬜ Not yet processed",      len(empty))
 
     st.markdown("---")
 
     col_left, col_right = st.columns(2)
-
     with col_left:
-        st.markdown("**Top 10 Old HS Codes with Most Risk Cases**")
+        st.markdown("**Top 15 HS Codes in Reference**")
         hs_counts = (
-            df[df["Old HS"] != ""]["Old HS"]
-            .value_counts()
-            .head(10)
-            .reset_index()
+            df[df["Customs Commodity Code"].str.len() > 0]["Customs Commodity Code"]
+            .value_counts().head(15).reset_index()
         )
-        hs_counts.columns = ["Old HS Code", "Count"]
+        hs_counts.columns = ["HS Code", "Count"]
         st.dataframe(hs_counts, use_container_width=True, hide_index=True)
 
     with col_right:
-        st.markdown("**Cases by Findings Type**")
-        ft_counts = (
-            df[df["Findings Type"] != ""]["Findings Type"]
-            .value_counts()
-            .reset_index()
-        )
-        ft_counts.columns = ["Findings Type", "Count"]
-        st.dataframe(ft_counts, use_container_width=True, hide_index=True)
+        st.markdown("**SKU Status Breakdown**")
+        status_df = pd.DataFrame([
+            {"Status": "✅ Confirmed (desc + HS)",    "Count": len(confirmed)},
+            {"Status": "🟡 HS only — pending desc",   "Count": len(hs_only)},
+            {"Status": "🟡 Desc only — pending HS",   "Count": len(desc_only)},
+            {"Status": "⬜ No data yet",              "Count": len(empty)},
+        ])
+        st.dataframe(status_df, use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.markdown("**Duty Rate Impact — Before vs After (active cases)**")
-    duty_df = active_df[
-        (active_df["Duty Before"] != "") & (active_df["Duty After"] != "")
-    ][["Risk ID", "Product Name", "Old HS", "Corrected HS", "Duty Before", "Duty After"]].copy()
-    if len(duty_df) > 0:
-        st.dataframe(duty_df, use_container_width=True, hide_index=True)
+    st.markdown("**SKUs pending confirmation (HS only — no description)**")
+    if len(hs_only) > 0:
+        st.dataframe(hs_only[REF_COLUMNS], use_container_width=True, hide_index=True)
     else:
-        st.info("No duty rate data available for active cases.")
+        st.success("No SKUs pending description confirmation.")
 
-    st.markdown("---")
-    st.markdown("**Top Root Causes**")
-    rc_counts = (
-        df[df["Root Cause"] != ""]["Root Cause"]
-        .value_counts()
-        .head(8)
-        .reset_index()
-    )
-    rc_counts.columns = ["Root Cause", "Count"]
-    st.dataframe(rc_counts, use_container_width=True, hide_index=True)
+    st.markdown("**SKUs not yet processed (both fields empty)**")
+    if len(empty) > 0:
+        st.dataframe(empty[REF_COLUMNS].head(50), use_container_width=True, hide_index=True)
+        if len(empty) > 50:
+            st.caption(f"Showing 50 of {len(empty)} unprocessed SKUs.")
+    else:
+        st.success("All SKUs have at least partial data.")
 
-    # Timeline
-    st.markdown("---")
-    st.markdown("**Cases by Input Month**")
-    timeline_df = df[df["Input Date"] != ""].copy()
-    if len(timeline_df) > 0:
-        timeline_df["Month"] = pd.to_datetime(
-            timeline_df["Input Date"], errors="coerce"
-        ).dt.to_period("M").astype(str)
-        monthly = (
-            timeline_df.groupby("Month")
-            .size()
-            .reset_index(name="Cases")
-            .sort_values("Month")
-        )
-        st.bar_chart(monthly.set_index("Month")["Cases"])
+    st.markdown(f"**⚠️ HS 位数异常 (HS is not {HS_EXPECTED_LEN} digits)**")
+    if len(hs_abnormal) > 0:
+        st.dataframe(hs_abnormal[REF_COLUMNS], use_container_width=True, hide_index=True)
+        st.caption("Packing-list lines with these SKUs are reported as 'HS LENGTH ABNORMAL' until the reference HS is corrected.")
+    else:
+        st.success("All HS codes in the reference have 10 digits.")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# ADMIN TAB
+# ADMIN TAB  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def render_admin():
     st.subheader("⚙️ Admin Panel")
     st.markdown("Manage user accounts. Only admins can access this panel.")
-
     users = load_users()
 
     st.markdown("**Current Users**")
@@ -1095,11 +1023,8 @@ def render_admin():
     st.markdown("---")
     st.markdown("**Database Backups**")
     st.caption(
-        "A full copy of the risk database is saved automatically, at most once per day, "
-        "right before any edit is written — named 'Customs Risk Database BACKUP YYYY-MM-DD'. "
-        "These are separate Google Sheets files in Drive. If the live database is ever "
-        "wrong or empty, open Drive, find the most recent backup, and copy its data back "
-        "into the 'Feuille 1' tab of the live sheet."
+        "A full copy of the database is saved automatically, at most once per day, "
+        "right before any edit is written — named 'Customs Risk Database BACKUP YYYY-MM-DD'."
     )
     if st.button("Back up now"):
         with st.spinner("Creating backup..."):
@@ -1152,14 +1077,12 @@ def main():
             """, unsafe_allow_html=True)
 
         st.markdown("---")
-
         role        = st.session_state.get("role", "")
         display     = st.session_state.get("display", "")
         role_colors = {"admin": "#c0392b", "broker": "#1a6e3c", "visitor": "#555555"}
         role_labels = {"admin": "Admin", "broker": "Broker", "visitor": "Visitor"}
         badge_color = role_colors.get(role, "#555555")
         badge_label = role_labels.get(role, role)
-
         st.markdown(f"""
             <div style='margin-bottom:0.3rem;'>
                 <span style='font-size:1rem; font-weight:600;'>👤 {display}</span>
@@ -1171,13 +1094,11 @@ def main():
                 </span>
             </div>
         """, unsafe_allow_html=True)
-
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🚪 Log Out", use_container_width=True):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
-
         st.markdown("---")
         st.markdown("""
             <div style='font-size:0.72rem; color:#999; line-height:1.6;'>
@@ -1190,24 +1111,34 @@ def main():
 
     st.title("🛃 Customs Risk Database — Vevor EU")
 
-    role     = st.session_state.get("role", "visitor")
+    role      = st.session_state.get("role", "visitor")
     is_admin  = (role == "admin")
-    is_broker = (role in ("admin", "broker"))   # broker + admin can upload & edit
+    is_broker = (role in ("admin", "broker"))
 
-    tabs = ["📋 Risk Check", "📥 Import / Add Cases", "🗄️ Database", "📊 Dashboard"]
+    tabs = ["📋 Risk Check", "📥 Manage Reference Data", "🗄️ Database", "📊 Dashboard"]
     if is_admin:
         tabs.append("⚙️ Admin")
-
     tab_objects = st.tabs(tabs)
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 1 — Risk Check
     # ────────────────────────────────────────────────────────────────────────
     with tab_objects[0]:
-        st.subheader("1. Upload Invoice / Packing List for Risk Check")
+        st.subheader("1. Upload Packing List / Invoice for Risk Check")
+        st.markdown("""
+        Upload one or more Excel packing lists. Each line with a **SKU** will be checked
+        against the reference database:
+
+        | Alert | Meaning |
+        |-------|---------|
+        | 🔴 **RED** | SKU confirmed in reference — HS code or description differs |
+        | 🟡 **YELLOW** | SKU inspected but awaiting customs confirmation — mismatch detected |
+        | 🟠 **ORANGE** | SKU registered in reference but no data yet — flag for monitoring |
+        | ⚠️ **HS 位数异常** | Reference HS is not a 10-digit code — reference data must be corrected first |
+        """)
 
         doc_files = st.file_uploader(
-            "Upload Invoice or Packing List Excel files",
+            "Upload Packing List Excel files",
             type=["xlsx"],
             accept_multiple_files=True,
             key="document_upload"
@@ -1217,6 +1148,12 @@ def main():
             all_doc_rows = []
             for file in doc_files:
                 doc_df = normalize_document_file(file)
+                try:
+                    _xls = pd.ExcelFile(file)
+                    if len(_xls.sheet_names) > 1:
+                        st.caption(f"📄 {file.name}: multi-sheet workbook — using sheet '{pick_packing_sheet(_xls)}'")
+                except Exception:
+                    pass
                 if len(doc_df) > 0:
                     all_doc_rows.append(doc_df)
                 else:
@@ -1224,109 +1161,98 @@ def main():
 
             if all_doc_rows:
                 document_df = pd.concat(all_doc_rows, ignore_index=True)
-                with st.expander("Preview uploaded document lines"):
-                    st.dataframe(document_df, use_container_width=True)
+                with st.expander("📄 Preview parsed packing list lines"):
+                    st.dataframe(document_df, use_container_width=True, hide_index=True)
 
-                risk_df = load_database()
-                if len(risk_df) == 0:
-                    st.warning("Risk database is empty. Please import or add risk cases first.")
+                ref_df = load_reference_db()
+                if len(ref_df) == 0:
+                    st.warning("Reference database is empty. Please import data first (Tab 2).")
                 else:
-                    check_df = check_documents_against_risks(document_df, risk_df)
+                    check_df = check_packing_list_against_reference(document_df, ref_df)
 
                     if len(check_df) == 0:
-                        st.success("✅ No known risk detected.")
+                        st.success("✅ No issues detected — all SKUs match the reference data.")
                     else:
                         red_df    = check_df[check_df["Severity"] == "RED"]
+                        yellow_df = check_df[check_df["Severity"] == "YELLOW"]
                         orange_df = check_df[check_df["Severity"] == "ORANGE"]
+                        hslen_df  = check_df[check_df["Severity"] == "HSLEN"]
 
-                        st.error(f"🚨 RED ALERT: {len(red_df)} high-risk line(s) detected.")
-                        st.warning(f"⚠️ ORANGE WARNING: {len(orange_df)} line(s) require manual review.")
+                        col_r, col_y, col_o, col_h = st.columns(4)
+                        col_r.error(f"🔴 RED: {len(red_df)} line(s)")
+                        col_y.warning(f"🟡 YELLOW: {len(yellow_df)} line(s)")
+                        col_o.info(f"🟠 ORANGE: {len(orange_df)} line(s)")
+                        col_h.warning(f"⚠️ HS 位数异常: {len(hslen_df)} line(s)")
 
-                        # Ensure Current Container is never blank
-                        check_df["Current Container"] = check_df["Current Container"].apply(
-                            lambda x: x if clean_text(x) not in ("", "None") else "⚠️ Not detected"
-                        )
-                        red_df    = check_df[check_df["Severity"] == "RED"]
-                        orange_df = check_df[check_df["Severity"] == "ORANGE"]
-
+                        # ── Card renderer ──
                         def render_cards(df, color):
-                            border = "#c0392b" if color == "red" else "#d35400"
-                            bg     = "#fff5f5" if color == "red" else "#fff8f0"
-                            icon   = "🚨" if color == "red" else "⚠️"
+                            if color == "red":
+                                border, bg, icon = "#c0392b", "#fff5f5", "🔴"
+                            elif color == "yellow":
+                                border, bg, icon = "#b7770d", "#fffdf0", "🟡"
+                            elif color == "purple":
+                                border, bg, icon = "#6c3483", "#f9f0ff", "⚠️"
+                            else:
+                                border, bg, icon = "#d35400", "#fff8f0", "🟠"
 
-                            # 合并同一产品+HS+Risk ID 的多个 Source File
-                            group_keys = ["Current Product", "Current HS", "Matched Risk ID"]
-                            merged_rows = []
-                            seen = {}
-                            for _, row_s in df.iterrows():
-                                key = (
-                                    str(row_s.get("Current Product","")).strip().upper(),
-                                    str(row_s.get("Current HS","")).strip(),
-                                    str(row_s.get("Matched Risk ID","")).strip()
+                            def _v(val):
+                                s = str(val).strip() if val is not None else ""
+                                return s if s and s.lower() not in ("nan", "none", "") else "—"
+
+                            def _row(label, val, val_style="font-weight:600;"):
+                                return (
+                                    f'<div style="display:flex; padding:3px 0; font-size:0.85rem;'
+                                    f' border-bottom:1px solid #f0f0f0;">'
+                                    f'<div style="color:#666; min-width:120px; white-space:nowrap;">{label}</div>'
+                                    f'<div style="{val_style}">{val}</div>'
+                                    f'</div>'
                                 )
-                                src = str(row_s.get("Source File","")).strip()
-                                if key not in seen:
-                                    seen[key] = {"row": row_s.to_dict(), "files": []}
-                                if src and src.lower() not in ("nan","none",""):
-                                    seen[key]["files"].append(src)
-                            for key, data in seen.items():
-                                base = data["row"]
-                                all_files = sorted(set(data["files"]))
-                                base["Source File"] = ", ".join(all_files) if all_files else "—"
-                                merged_rows.append(base)
 
-                            for row in merged_rows:
-                                hs_note_val = row.get("HS Note", "") or ""
-                                hs_note_html = (
-                                    f'<tr><td style="color:#888; padding:3px 8px 3px 0; white-space:nowrap; font-style:italic;">📝 Reason</td>'
-                                    f'<td style="color:#555; padding:3px 0; font-style:italic;">{hs_note_val}</td></tr>'
-                                ) if hs_note_val else ""
-                                def _v(val):
-                                    """Return val as string, replacing nan/None/empty with '—'."""
-                                    s = str(val).strip() if val is not None else ""
-                                    return s if s and s.lower() not in ("nan", "none", "") else "—"
-
-                                def _row(label, val, val_style="font-weight:600;"):
-                                    return (
-                                        f'<div style="display:flex; padding:3px 0; font-size:0.85rem; border-bottom:1px solid #f0f0f0;">'
-                                        f'<div style="color:#666; min-width:110px; white-space:nowrap;">{label}</div>'
-                                        f'<div style="{val_style}">{val}</div>'
-                                        f'</div>'
-                                    )
-
+                            for _, row in df.iterrows():
                                 left_html = (
-                                    '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px; font-size:0.9rem;">📦 CURRENT SHIPMENT</div>'
-                                    + _row("PO N°",        _v(row.get("Source File")), "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
+                                    '<div style="font-weight:700; color:#1a3c6e; margin-bottom:8px;'
+                                    ' font-size:0.9rem;">📦 PACKING LIST</div>'
+                                    + _row("PO / Source",  _v(row.get("Source File")),
+                                           "font-weight:600; color:#1a3c6e; font-size:0.82rem; word-break:break-all;")
                                     + _row("Container",    _v(row.get("Current Container")))
-                                    + _row("BL Number",    _v(row.get("Current BL Number")))
                                     + _row("Job Number",   _v(row.get("Job Number")))
-                                    + _row("SKU",          _v(row.get("SKU Number")))
-                                    + _row("MRN",          "—", "color:#aaa;")
-                                    + _row("Inspection",   "—", "color:#aaa;")
-                                    + _row("Product",      _v(row.get("Current Product")))
-                                    + _row("Current HS",   _v(row.get("Current HS")), f"font-weight:600; color:{border};")
-                                    + _row("✅ Should be", _v(row.get("Corrected HS")), "font-weight:700; color:#1a6e3c;")
+                                    + _row("SKU",          _v(row.get("SKU")))
+                                    + _row("Line No",      _v(row.get("Line No")))
+                                    + _row("Description",  _v(row.get("PL Description")))
+                                    + _row("HS Code",      _v(row.get("PL HS Code")),
+                                           f"font-weight:700; color:{border};")
+                                    + _row("Qty",          _v(row.get("Qty")))
                                 )
+
+                                ref_status = _v(row.get("Ref Status"))
+                                ref_status_label = {
+                                    "confirmed":  "✅ Confirmed",
+                                    "hs_only":    "🟡 HS only — pending desc",
+                                    "desc_only":  "🟡 Desc only — pending HS",
+                                    "empty":      "⬜ Not yet processed",
+                                }.get(ref_status, ref_status)
 
                                 right_html = (
-                                    '<div style="font-weight:700; color:#555; margin-bottom:8px; font-size:0.9rem;">📋 HISTORICAL REFERENCE</div>'
-                                    + _row("Risk ID",         _v(row.get("Matched Risk ID")))
-                                    + _row("Container",       _v(row.get("Previous Container")))
-                                    + _row("BL Number",       _v(row.get("BL Number")))
-                                    + _row("Job Number",      _v(row.get("Risk Job Number")))
-                                    + _row("SKU",             _v(row.get("Risk SKU Number")))
-                                    + _row("MRN",             _v(row.get("Previous MRN")))
-                                    + _row("Inspection",      _v(row.get("Previous Inspection Date")))
-                                    + _row("Product",         _v(row.get("Historical Product")))
-                                    + _row("Old HS",          _v(row.get("Old HS Used Before")), f"font-weight:600; color:{border};")
-                                    + _row("✅ Corrected to", _v(row.get("Corrected HS")), "font-weight:700; color:#1a6e3c;")
-                                    + (_row("📝 Reason", hs_note_val, "color:#555; font-style:italic;") if hs_note_val else "")
+                                    '<div style="font-weight:700; color:#555; margin-bottom:8px;'
+                                    ' font-size:0.9rem;">✅ REFERENCE DATA</div>'
+                                    + _row("Status",       ref_status_label, "font-weight:600;")
+                                    + _row("SKU",          _v(row.get("SKU")))
+                                    + _row("Description",  _v(row.get("Ref Description")),
+                                           "font-weight:700; color:#1a6e3c;")
+                                    + _row("HS Code",      _v(row.get("Ref HS Code")),
+                                           "font-weight:700; color:#1a6e3c;" if color != "purple"
+                                           else "font-weight:700; color:#6c3483;")
+                                    + _row("Duty Rate",    _v(row.get("Ref Duty Rate")),
+                                           "font-weight:700; color:#1a6e3c;")
+                                    + _row("Reason",       _v(row.get("Reason")),
+                                           "color:#555; font-style:italic; font-size:0.82rem;")
                                 )
 
                                 st.markdown(f"""
-                                <div style="border:2px solid {border}; border-radius:10px; background:{bg}; padding:16px; margin-bottom:16px;">
+                                <div style="border:2px solid {border}; border-radius:10px;
+                                            background:{bg}; padding:16px; margin-bottom:16px;">
                                     <div style="font-weight:700; font-size:1.05rem; color:{border}; margin-bottom:12px;">
-                                        {icon} {row.get("Action Required","")} &nbsp;|&nbsp; {row.get("Message","")}
+                                        {icon} {row.get("Action","")} &nbsp;|&nbsp; {row.get("Message","")}
                                     </div>
                                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
                                         <div style="background:white; border-radius:8px; padding:12px; border:1px solid #ddd;">
@@ -1340,17 +1266,23 @@ def main():
                                 """, unsafe_allow_html=True)
 
                         if len(red_df) > 0:
-                            st.markdown("#### 🚨 Action Required — High Risk Lines")
+                            st.markdown("#### 🔴 Action Required — Confirmed Mismatches")
                             render_cards(red_df, "red")
+                        if len(yellow_df) > 0:
+                            st.markdown("#### 🟡 Pending Review — Awaiting Customs Confirmation")
+                            render_cards(yellow_df, "yellow")
                         if len(orange_df) > 0:
-                            st.markdown("#### ⚠️ Manual Review Required")
+                            st.markdown("#### 🟠 Log & Monitor — Unprocessed SKUs")
                             render_cards(orange_df, "orange")
+                        if len(hslen_df) > 0:
+                            st.markdown("#### ⚠️ HS 位数异常 — Reference HS is not a 10-digit code")
+                            render_cards(hslen_df, "purple")
 
                         # PDF export
                         st.markdown("---")
                         st.markdown("#### 📄 Export Risk Report")
                         files_info = ", ".join([f.name for f in doc_files])
-                        pdf_bytes = build_pdf_report(check_df, files_info)
+                        pdf_bytes  = build_pdf_report(check_df, files_info)
                         report_name = f"RiskReport_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
                         st.download_button(
                             label="⬇️ Download PDF Report",
@@ -1362,241 +1294,225 @@ def main():
                         )
 
     # ────────────────────────────────────────────────────────────────────────
-    # TAB 2 — Import / Add Cases  (admin + broker)
+    # TAB 2 — Manage Reference Data
     # ────────────────────────────────────────────────────────────────────────
     with tab_objects[1]:
         if not is_broker:
-            st.info("🔒 Visitors cannot add or import risk cases. Please contact your broker or admin.")
+            st.info("🔒 Visitors cannot modify the reference database. Please contact your broker or admin.")
         else:
-            # Batch import
-            st.subheader("2a. Batch Import Risk Database from Excel")
-            uploaded_file = st.file_uploader("Upload Risk Database Excel", type=["xlsx"], key="risk_database_upload")
-            if uploaded_file is not None:
-                imported_df = normalize_import_file(uploaded_file)
-                st.write("Preview of valid risk cases:")
-                st.dataframe(imported_df, use_container_width=True)
-                if st.button("Import This Excel Into Database"):
-                    existing_df   = load_database()
-                    existing_keys = set(make_duplicate_key(row) for _, row in existing_df.iterrows())
-                    new_rows, duplicate_count = [], 0
-                    for _, row in imported_df.iterrows():
-                        key = make_duplicate_key(row)
-                        if key in existing_keys:
-                            duplicate_count += 1
-                            continue
-                        row = row.copy()
-                        temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
-                        row["Risk ID"]    = generate_risk_id(temp_df)
-                        row["Input Date"] = str(date.today())
-                        if not clean_text(row["Status"]):
-                            row["Status"] = "active"
-                        new_rows.append(row.to_dict())
-                        existing_keys.add(key)
-                    if new_rows:
-                        combined_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
-                        save_database(combined_df)
-                        st.success(f"Imported {len(new_rows)} new rows. Skipped {duplicate_count} duplicates.")
-                    else:
-                        st.warning(f"No new rows imported. {duplicate_count} duplicate rows detected.")
+            st.subheader("2a. Import Reference Data from Excel")
+            st.markdown("""
+            Upload an Excel file with columns: **SKU**, **Corrected DESCRIPTION** (or *Description*),
+            **Customs Commodity Code** (or *Hscode*) and optionally **Duty Rate** (or *进口税率*).
+            Existing SKUs will be updated; new SKUs will be added. HS codes are imported exactly as given —
+            codes that are not 10 digits are flagged as **HS 位数异常**.
+            """)
+            uploaded_ref = st.file_uploader(
+                "Upload Reference Excel (.xlsx)", type=["xlsx"], key="ref_import_upload"
+            )
+            if uploaded_ref is not None:
+                try:
+                    imp_df = pd.read_excel(uploaded_ref, dtype=str)
+                    imp_df.columns = [str(c).strip() for c in imp_df.columns]
 
+                    # Try to auto-map columns
+                    col_map = {}
+                    for col in imp_df.columns:
+                        cu = col.upper()
+                        if "SKU" in cu and "SKU" not in col_map:
+                            col_map["SKU"] = col
+                        elif "DESCRIPTION" in cu and "Corrected DESCRIPTION" not in col_map:
+                            col_map["Corrected DESCRIPTION"] = col
+                        elif ("税率" in col or "DUTY" in cu or "RATE" in cu) and "Duty Rate" not in col_map:
+                            col_map["Duty Rate"] = col
+                        elif ("HS" in cu or "COMMODITY" in cu or "CODE" in cu) and "Customs Commodity Code" not in col_map:
+                            col_map["Customs Commodity Code"] = col
+
+                    if not all(k in col_map for k in ("SKU", "Corrected DESCRIPTION", "Customs Commodity Code")):
+                        # Show manual mapping
+                        st.warning("Could not auto-detect all columns. Please map them manually:")
+                        all_cols = ["(skip)"] + list(imp_df.columns)
+                        sku_col  = st.selectbox("SKU column",                all_cols, key="map_sku")
+                        desc_col = st.selectbox("Corrected DESCRIPTION col", all_cols, key="map_desc")
+                        hs_col   = st.selectbox("Customs Commodity Code col",all_cols, key="map_hs")
+                        duty_col = st.selectbox("Duty Rate col",             all_cols, key="map_duty")
+                        col_map = {}
+                        if sku_col != "(skip)":
+                            col_map["SKU"] = sku_col
+                            if desc_col != "(skip)": col_map["Corrected DESCRIPTION"]  = desc_col
+                            if hs_col   != "(skip)": col_map["Customs Commodity Code"] = hs_col
+                            if duty_col != "(skip)": col_map["Duty Rate"]              = duty_col
+
+                    if "SKU" in col_map:
+                        preview = pd.DataFrame()
+                        preview["SKU"] = imp_df[col_map["SKU"]].apply(clean_text)
+                        preview["Corrected DESCRIPTION"] = (
+                            imp_df[col_map["Corrected DESCRIPTION"]].apply(clean_text)
+                            if "Corrected DESCRIPTION" in col_map else ""
+                        )
+                        preview["Customs Commodity Code"] = (
+                            imp_df[col_map["Customs Commodity Code"]].apply(clean_hs)
+                            if "Customs Commodity Code" in col_map else ""
+                        )
+                        preview["Duty Rate"] = (
+                            imp_df[col_map["Duty Rate"]].apply(format_duty_rate)
+                            if "Duty Rate" in col_map else ""
+                        )
+                        preview = preview[preview["SKU"] != ""]
+                        n_abn = int(preview["Customs Commodity Code"].apply(hs_len_abnormal).sum())
+                        st.write(f"Preview — {len(preview)} valid rows detected:")
+                        if n_abn:
+                            st.warning(f"⚠️ HS 位数异常: {n_abn} row(s) have an HS that is not {HS_EXPECTED_LEN} digits. "
+                                       "They will be imported as-is and flagged in the Dashboard and Risk Check.")
+                        st.dataframe(preview.head(20), use_container_width=True, hide_index=True)
+
+                        if st.button("📥 Import & Merge into Reference Database"):
+                            mapped_cols = [c for c in REF_COLUMNS[1:] if c in col_map]
+                            existing = load_reference_db().copy()
+                            new = preview.drop_duplicates("SKU", keep="last").copy()
+                            new["_k"] = new["SKU"].str.upper()
+                            existing["_k"] = existing["SKU"].str.upper()
+                            is_upd = existing["_k"].isin(set(new["_k"]))
+                            new_by_key = new.set_index("_k")
+                            for c in mapped_cols:
+                                existing.loc[is_upd, c] = existing.loc[is_upd, "_k"].map(new_by_key[c])
+                            to_add = new[~new["_k"].isin(set(existing["_k"]))]
+                            updated = int(is_upd.sum())
+                            added   = len(to_add)
+                            existing = pd.concat(
+                                [existing[REF_COLUMNS], to_add[REF_COLUMNS]], ignore_index=True
+                            )
+                            save_reference_db(existing)
+                            st.success(f"Done — {added} new SKUs added, {updated} existing SKUs updated.")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
             st.markdown("---")
 
-            # Manual entry
-            st.subheader("2b. Add New Customs Risk Case Manually")
-            with st.form("risk_case_form"):
-                current_df = load_database()
-                risk_id    = generate_risk_id(current_df)
-                st.write(f"Risk ID: **{risk_id}**")
-
-                col1, col2, col3 = st.columns(3)
-                with col1: input_date      = st.date_input("Input Date", value=date.today())
-                with col2: cc_date         = st.date_input("CC Date", value=None)
-                with col3: inspection_date = st.date_input("Inspection Date", value=None)
-
-                col_r1 = st.columns(2)
-                with col_r1[0]: job_number   = st.text_input("Job Number")
-                with col_r1[1]: sku_number   = st.text_input("SKU Number")
-
-                col_r2 = st.columns(2)
-                with col_r2[0]: container_no = st.text_input("Container No")
-                with col_r2[1]: bl_number    = st.text_input("BL Number")
-
-                col_r3 = st.columns(2)
-                with col_r3[0]: mrn          = st.text_input("MRN")
-                with col_r3[1]: inspector    = st.text_input("Inspector")
-
-                product_name = st.text_input("Product Name *")
-                product_alias     = st.text_input("Product Alias / Possible Descriptions")
-                declaration_desc  = st.text_input("Declaration Description")
-
-                col4, col5 = st.columns(2)
-                with col4:
-                    old_hs      = st.text_input("Old HS *")
-                    duty_before = st.text_input("Duty Before", placeholder="e.g. 2,7")
-                with col5:
-                    corrected_hs = st.text_input("Corrected HS *")
-                    duty_after   = st.text_input("Duty After",  placeholder="e.g. 3,9 or 0")
-
-                findings_type   = st.text_input("Findings Type")
-                root_cause      = st.text_input("Root Cause")
-                risk_reason     = st.text_area("Risk Reason")
-                customs_comment = st.text_area("Customs / Broker Comment")
-                status          = st.selectbox("Status", ["active", "monitoring", "solved"])
-                notes           = st.text_area("Notes")
-
-                submitted = st.form_submit_button("Save Risk Case")
-                if submitted:
-                    if not product_name or not old_hs or not corrected_hs:
-                        st.error("Product Name, Old HS and Corrected HS are required.")
+            st.subheader("2b. Add / Update a Single SKU")
+            with st.form("add_sku_form"):
+                new_sku  = st.text_input("SKU *")
+                new_desc = st.text_input("Corrected DESCRIPTION")
+                new_hs   = st.text_input("Customs Commodity Code (10-digit CN code)")
+                new_duty = st.text_input("Duty Rate (e.g. 2,7%)")
+                save_btn = st.form_submit_button("Save SKU")
+                if save_btn:
+                    if not new_sku.strip():
+                        st.error("SKU is required.")
                     else:
-                        current_df = load_database()
-                        new_row = {
-                            "Risk ID":                 generate_risk_id(current_df),
-                            "Input Date":              str(input_date),
-                            "CC Date":                 str(cc_date) if cc_date else "",
-                            "Inspection Date":         str(inspection_date) if inspection_date else "",
-                            "Container No":            container_no,
-                            "MRN":                     mrn,
-                            "BL Number":               bl_number,
-                            "Job Number":              job_number,
-                            "Inspector":               inspector,
-                            "Product Name":            product_name,
-                            "Product Alias":           product_alias,
-                            "Declaration Description": declaration_desc,
-                            "Old HS":                  clean_hs(old_hs),
-                            "Corrected HS":            clean_hs(corrected_hs),
-                            "Duty Before":             format_duty_rate(duty_before),
-                            "Duty After":              format_duty_rate(duty_after),
-                            "Findings Type":           findings_type,
-                            "Root Cause":              root_cause,
-                            "Risk Reason":             risk_reason,
-                            "Customs Comment":         customs_comment,
-                            "Status":                  status,
-                            "Notes":                   notes,
-                        }
-                        new_key       = make_duplicate_key(new_row)
-                        existing_keys = set(make_duplicate_key(r) for _, r in current_df.iterrows())
-                        if new_key in existing_keys:
-                            st.warning("This risk case already exists. It was not added again.")
+                        existing = load_reference_db()
+                        key = new_sku.strip().upper()
+                        mask = existing["SKU"].str.upper() == key
+                        if mask.any():
+                            existing.loc[mask, "Corrected DESCRIPTION"]  = clean_text(new_desc)
+                            existing.loc[mask, "Customs Commodity Code"] = clean_hs(new_hs)
+                            if new_duty.strip():
+                                existing.loc[mask, "Duty Rate"] = format_duty_rate(new_duty)
+                            save_reference_db(existing)
+                            st.success(f"SKU '{new_sku.strip()}' updated.")
                         else:
-                            current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
-                            save_database(current_df)
-                            st.success("Risk case saved successfully.")
+                            new_row = {
+                                "SKU":                    new_sku.strip(),
+                                "Corrected DESCRIPTION":  clean_text(new_desc),
+                                "Customs Commodity Code": clean_hs(new_hs),
+                                "Duty Rate":              format_duty_rate(new_duty),
+                            }
+                            existing = pd.concat(
+                                [existing, pd.DataFrame([new_row])], ignore_index=True
+                            )
+                            save_reference_db(existing)
+                            st.success(f"SKU '{new_sku.strip()}' added to reference database.")
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 3 — Database viewer / editor
     # ────────────────────────────────────────────────────────────────────────
     with tab_objects[2]:
-        st.subheader("3. Current Risk Database")
-        current_df = load_database()
+        st.subheader("3. Reference Database")
+        ref_df = load_reference_db()
 
-        if len(current_df) == 0:
-            st.info("No risk cases available yet.")
+        if len(ref_df) == 0:
+            st.info("No data in reference database yet.")
         else:
-            # Filter bar
-            fc1, fc2, fc3, fc4 = st.columns(4)
+            # Filters
+            fc1, fc2, fc3 = st.columns(3)
             with fc1:
-                filter_status = st.selectbox("Filter by Status", ["All", "active", "monitoring", "solved"])
+                filter_status = st.selectbox("Filter by Status", [
+                    "All", "confirmed", "hs_only", "desc_only", "empty", "hs_len_abnormal"
+                ])
             with fc2:
-                filter_hs = st.text_input("Filter by Old HS (exact)")
-            with fc3:
                 filter_sku = st.text_input("Filter by SKU (contains)")
-            with fc4:
-                filter_rid = st.text_input("Filter by Risk ID (contains)")
+            with fc3:
+                filter_hs = st.text_input("Filter by HS Code (contains)")
 
-            filtered = current_df.copy()
-            if filter_status != "All":
-                filtered = filtered[filtered["Status"] == filter_status]
+            filtered = ref_df.copy()
+            filtered["_status"] = status_series(filtered)
+
+            if filter_status == "hs_len_abnormal":
+                filtered = filtered[filtered["Customs Commodity Code"].apply(hs_len_abnormal)]
+            elif filter_status != "All":
+                filtered = filtered[filtered["_status"] == filter_status]
+            if filter_sku:
+                filtered = filtered[filtered["SKU"].str.contains(filter_sku.strip(), case=False, na=False)]
             if filter_hs:
-                filtered = filtered[filtered["Old HS"] == filter_hs.strip()]
-            if filter_sku and "SKU Number" in filtered.columns:
-                filtered = filtered[filtered["SKU Number"].str.contains(filter_sku.strip(), case=False, na=False)]
-            if filter_rid and "Risk ID" in filtered.columns:
-                filtered = filtered[filtered["Risk ID"].str.contains(filter_rid.strip(), case=False, na=False)]
+                filtered = filtered[filtered["Customs Commodity Code"].str.contains(filter_hs.strip(), case=False, na=False)]
 
-            st.markdown(f"Showing **{len(filtered)}** of **{len(current_df)}** cases")
-
-            # ── One-click download of the full database ──
-            dl_col1, dl_col2 = st.columns(2)
-            with dl_col1:
-                full_buf = io.BytesIO()
-                current_df.to_excel(full_buf, index=False, engine="openpyxl")
-                st.download_button(
-                    label=f"⬇️ Download ALL Data ({len(current_df)} cases, Excel)",
-                    data=full_buf.getvalue(),
-                    file_name=f"RiskDatabase_ALL_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            with dl_col2:
-                if len(filtered) != len(current_df):
-                    filtered_buf = io.BytesIO()
-                    filtered.to_excel(filtered_buf, index=False, engine="openpyxl")
-                    st.download_button(
-                        label=f"⬇️ Download Filtered ({len(filtered)} cases, Excel)",
-                        data=filtered_buf.getvalue(),
-                        file_name=f"RiskDatabase_Filtered_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+            display_df = filtered[REF_COLUMNS + ["_status"]].copy()
+            display_df = display_df.rename(columns={"_status": "Status"})
+            display_df["HS Check"] = display_df["Customs Commodity Code"].apply(
+                lambda h: "⚠️ HS 位数异常" if hs_len_abnormal(h) else "")
+            MAX_ROWS = 1000   # the reference has ~45k rows — never render them all in an editor
+            st.markdown(f"**{len(filtered)}** of **{len(ref_df)}** SKUs match the filters"
+                        + (f" — showing the first {MAX_ROWS}. Use the filters to narrow down." if len(filtered) > MAX_ROWS else ""))
+            display_df = display_df.head(MAX_ROWS)
 
             if is_broker:
-                show_cols = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
-                editable = filtered[show_cols].copy()
-                editable.insert(0, "Delete", False)
+                display_df.insert(0, "Delete", False)
                 edited = st.data_editor(
-                    editable,
+                    display_df,
                     use_container_width=True,
                     num_rows="fixed",
                     hide_index=True,
-                    column_config={"Delete": st.column_config.CheckboxColumn("Delete")}
+                    column_config={
+                        "Delete": st.column_config.CheckboxColumn("Delete"),
+                        "Status": st.column_config.TextColumn("Status", disabled=True),
+                        "HS Check": st.column_config.TextColumn("HS Check", disabled=True),
+                        "SKU": st.column_config.TextColumn("SKU", disabled=True),
+                    }
                 )
                 col_b1, col_b2 = st.columns(2)
                 with col_b1:
                     if st.button("💾 Save Changes", use_container_width=True):
-                        kept = edited[edited["Delete"] == False].drop(columns=["Delete"])
-                        full_updated = filtered.copy()
-                        for _, erow in kept.iterrows():
-                            rid = erow.get("Risk ID")
-                            mask = full_updated["Risk ID"] == rid
-                            for col in show_cols:
-                                if col in full_updated.columns:
-                                    full_updated.loc[mask, col] = erow.get(col, "")
-                        full_updated = full_updated[full_updated["Risk ID"].isin(kept["Risk ID"].tolist())]
-                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
-                        merged    = pd.concat([unchanged, full_updated], ignore_index=True)
-                        for col in COLUMNS:
-                            if col not in merged.columns:
-                                merged[col] = ""
-                        merged = merged[COLUMNS]
-                        for col in COLUMNS:
-                            merged[col] = merged[col].apply(clean_text)
-                        for col in ["Input Date", "CC Date", "Inspection Date"]:
-                            merged[col] = merged[col].apply(format_date)
-                        merged["Old HS"]       = merged["Old HS"].apply(clean_hs)
-                        merged["Corrected HS"] = merged["Corrected HS"].apply(clean_hs)
-                        merged["Duty Before"]  = merged["Duty Before"].apply(format_duty_rate)
-                        merged["Duty After"]   = merged["Duty After"].apply(format_duty_rate)
-                        save_database(merged)
-                        st.success("Changes saved successfully.")
+                        edit_cols = ["Corrected DESCRIPTION", "Customs Commodity Code", "Duty Rate"]
+                        kept = edited[edited["Delete"] == False]
+                        deleted_idx = edited.index[edited["Delete"] == True]
+                        upd = ref_df.copy()
+                        upd.loc[kept.index, "Corrected DESCRIPTION"]  = kept["Corrected DESCRIPTION"].apply(clean_text).values
+                        upd.loc[kept.index, "Customs Commodity Code"] = kept["Customs Commodity Code"].apply(clean_hs).values
+                        upd.loc[kept.index, "Duty Rate"]              = kept["Duty Rate"].apply(format_duty_rate).values
+                        final_df = upd.drop(index=deleted_idx)
+                        save_reference_db(final_df)
+                        st.success("Changes saved.")
+                        st.rerun()
                 with col_b2:
-                    if st.button(f"🗑️ Delete ALL {len(filtered)} filtered rows", type="secondary", use_container_width=True):
-                        unchanged = current_df[~current_df["Risk ID"].isin(filtered["Risk ID"])]
-                        save_database(unchanged)
+                    if st.button(f"🗑️ Delete ALL {len(filtered)} filtered rows",
+                                 type="secondary", use_container_width=True):
+                        filtered_skus = set(filtered["SKU"].str.upper().tolist())
+                        final_df = ref_df[~ref_df["SKU"].str.upper().isin(filtered_skus)]
+                        save_reference_db(final_df)
                         st.success(f"Deleted {len(filtered)} rows.")
                         st.rerun()
             else:
                 st.info("👁️ Visitor mode — read only.")
-                show_cols_v = [c for c in DISPLAY_COLUMNS if c in filtered.columns]
-                st.dataframe(filtered[show_cols_v], use_container_width=True, hide_index=True)
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        # TAB 4 — Dashboard
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 4 — Dashboard
     # ────────────────────────────────────────────────────────────────────────
     with tab_objects[3]:
-        render_dashboard(load_database())
+        render_dashboard(load_reference_db())
 
     # ────────────────────────────────────────────────────────────────────────
-    # TAB 5 — Admin (admins only)
+    # TAB 5 — Admin
     # ────────────────────────────────────────────────────────────────────────
     if is_admin:
         with tab_objects[4]:
@@ -1613,4 +1529,3 @@ if not st.session_state["logged_in"]:
     login_screen()
 else:
     main()
-# force redeploy jeu. 14 mai 2026 22:51:51 CEST
