@@ -885,6 +885,116 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list):
     return out.getvalue(), applied, skipped
 
 
+def _merged_top_value(ws, coord):
+    """Value of a cell; for a merged cell, the value of the merged block's top-left cell."""
+    for mr in ws.merged_cells.ranges:
+        if coord in mr:
+            return ws[mr.start_cell.coordinate].value
+    return ws[coord].value
+
+
+def _find_doc_table(ws, max_scan: int = 40):
+    """Locate the line-item table of an invoice / packing list / contract sheet.
+    Returns dict(header_row, no_col, desc_col, hs_col) or None if the sheet has no such table."""
+    from openpyxl.utils import get_column_letter
+    for r in range(1, min(ws.max_row, max_scan) + 1):
+        no_col = desc_col = hs_col = None
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str):
+                continue
+            t = re.sub(r"\s+", " ", v).strip().lower()
+            if re.fullmatch(r"no\.?", t) and no_col is None:
+                no_col = get_column_letter(c)
+            elif "desc" in t and desc_col is None:
+                desc_col = get_column_letter(c)
+            elif re.match(r"(hs|hts)\b", t) and hs_col is None:
+                hs_col = get_column_letter(c)
+        if no_col and desc_col and hs_col:
+            return {"header_row": r, "no_col": no_col, "desc_col": desc_col, "hs_col": hs_col}
+    return None
+
+
+def _line_rows(ws, tbl) -> dict:
+    """{line number: excel row} for the line-item rows below the header."""
+    out = {}
+    for r in range(tbl["header_row"] + 1, ws.max_row + 1):
+        n = ws[f"{tbl['no_col']}{r}"].value
+        try:
+            n = int(float(str(n).strip()))
+        except Exception:
+            continue
+        out.setdefault(n, r)
+    return out
+
+
+def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: list):
+    """Apply the packing-list HS corrections AND mirror them on the other sheets of a
+    three-in-one workbook (invoice / contract): same line No. -> same HS, cell painted yellow.
+
+    A line is only mirrored when its description on the other sheet is identical to the
+    packing-list description; anything that does not line up is left untouched and reported.
+    Returns (new_bytes, applied, skipped) with sheet-qualified cell names, e.g. '发票!C16'.
+    """
+    import io, openpyxl
+
+    new_bytes, applied_pl, skipped_pl = apply_hs_corrections(file_bytes, pl_sheet, pl_edits)
+    applied = [(f"{pl_sheet}!{c}", o, n, k) for c, o, n, k in applied_pl]
+    skipped = [(f"{pl_sheet}!{c}", why) for c, why in skipped_pl]
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    if len(wb.sheetnames) < 2:
+        return new_bytes, applied, skipped
+    pl_ws  = wb[pl_sheet]
+    pl_tbl = _find_doc_table(pl_ws)
+    if pl_tbl is None:
+        skipped.append((pl_sheet, "could not read the line numbers of the packing list, so the other sheets were not changed"))
+        return new_bytes, applied, skipped
+
+    def _norm(x):
+        return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+
+    for name in wb.sheetnames:
+        if name == pl_sheet:
+            continue
+        ws  = wb[name]
+        tbl = _find_doc_table(ws)
+        if tbl is None:
+            continue                                   # not an invoice/contract-style sheet
+        rows_by_no = _line_rows(ws, tbl)
+        edits = []
+        for row, _col, new_hs in pl_edits:
+            n = pl_ws[f"{pl_tbl['no_col']}{int(row)}"].value
+            try:
+                n = int(float(str(n).strip()))
+            except Exception:
+                skipped.append((f"{name}", f"packing-list row {row} has no line number — not mirrored"))
+                continue
+            r = rows_by_no.get(n)
+            if r is None:
+                skipped.append((name, f"line No. {n} not found — not mirrored"))
+                continue
+            d_pl  = _norm(_merged_top_value(pl_ws, f"{pl_tbl['desc_col']}{int(row)}"))
+            d_oth = _norm(_merged_top_value(ws, f"{tbl['desc_col']}{r}"))
+            if d_pl != d_oth:
+                skipped.append((name, f"line No. {n}: description differs from the packing list — not changed, please check by hand"))
+                continue
+            top = _merged_top_value(ws, f"{tbl['hs_col']}{r}")
+            if isinstance(top, str) and top.startswith("="):
+                skipped.append((name, f"line No. {n}: HS is a formula — left unchanged"))
+                continue
+            edits.append((r, tbl["hs_col"], new_hs))
+        if not edits:
+            continue
+        try:
+            new_bytes, a, sk = apply_hs_corrections(new_bytes, name, edits)
+        except Exception as e:
+            skipped.append((name, f"could not edit this sheet: {e}"))
+            continue
+        applied += [(f"{name}!{c}", o, n, k) for c, o, n, k in a]
+        skipped += [(f"{name}!{c}", why) for c, why in sk]
+    return new_bytes, applied, skipped
+
+
 def build_card_html(row, border: str, bg: str, icon: str) -> str:
     """Side-by-side comparison card: DATABASE (left) vs PACKING LIST (right), one aligned
     row per field. Differences are highlighted in red, matches in green."""
@@ -1513,7 +1623,7 @@ def main():
                                 st.caption("No line selected.")
                                 continue
                             try:
-                                new_bytes, applied, skipped = apply_hs_corrections(
+                                new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
                                     file_bytes[fname], chosen.iloc[0]["Sheet"],
                                     [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()],
                                 )
@@ -1525,8 +1635,8 @@ def main():
                             for cell, why in skipped:
                                 st.warning(f"Cell {cell} left unchanged — {why}")
                             if len(pd.ExcelFile(io.BytesIO(file_bytes[fname])).sheet_names) > 1:
-                                st.caption(f"Only the '{chosen.iloc[0]['Sheet']}' sheet is changed; other sheets in this workbook "
-                                           "(e.g. invoice, contract) are not modified.")
+                                st.caption("Three-in-one file: the same HS correction is made on the invoice, packing list and "
+                                           "contract (same line No. and same description), each changed cell in yellow.")
                             if applied:
                                 stem = fname.rsplit(".", 1)[0]
                                 st.download_button(
