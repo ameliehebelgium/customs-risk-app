@@ -1376,12 +1376,26 @@ def main():
         | ⚠️ **HS 位数异常** | Reference HS is not a 10-digit code — reference data must be corrected first |
         """)
 
+        # Changing the uploader's key is the only way to empty a Streamlit file_uploader.
+        st.session_state.setdefault("doc_uploader_ver", 0)
         doc_files = st.file_uploader(
             "Upload Packing List Excel files",
             type=["xlsx"],
             accept_multiple_files=True,
-            key="document_upload"
+            key=f"document_upload_{st.session_state['doc_uploader_ver']}"
         )
+
+        if doc_files:
+            if st.button(f"🗑️ Remove all uploaded files ({len(doc_files)})", key="clear_all_docs"):
+                st.session_state["doc_uploader_ver"] += 1
+                for _k in list(st.session_state.keys()):      # forget per-file ticks / download widgets
+                    if str(_k).startswith(("fix_", "dl_fix_")):
+                        del st.session_state[_k]
+                st.rerun()
+
+        # Placeholder right under the uploader: the "download all" button is filled in
+        # here later, once the corrected files exist, so it shows at the top of the results.
+        zip_slot = st.container()
 
         if doc_files:
             all_doc_rows = []
@@ -1537,16 +1551,16 @@ def main():
                                         _i += 1
                                     used_names.add(_n)
                                     zf.writestr(_n, _data)
-                            st.markdown("---")
-                            st.download_button(
-                                label=f"⬇️ Download ALL corrected packing lists ({len(corrected_files)} files, ZIP)",
-                                data=zip_buf.getvalue(),
-                                file_name=f"HS_corrected_packing_lists_{date.today().isoformat()}.zip",
-                                mime="application/zip",
-                                type="primary",
-                                use_container_width=True,
-                                key="dl_fix_all_zip",
-                            )
+                            with zip_slot:
+                                st.download_button(
+                                    label=f"⬇️ Download ALL corrected packing lists ({len(corrected_files)} files, ZIP)",
+                                    data=zip_buf.getvalue(),
+                                    file_name=f"HS_corrected_packing_lists_{date.today().isoformat()}.zip",
+                                    mime="application/zip",
+                                    type="primary",
+                                    use_container_width=True,
+                                    key="dl_fix_all_zip",
+                                )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
