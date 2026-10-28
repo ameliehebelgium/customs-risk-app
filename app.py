@@ -1477,6 +1477,7 @@ def main():
                         fix_df = fix_df[fix_df["HS Row"].astype(str) != ""]
                         if len(fix_df) == 0:
                             st.info("No HS differences that can be corrected automatically.")
+                        corrected_files = []   # (download name, bytes) of every file actually changed
                         for fname in fix_df["File Name"].unique() if len(fix_df) else []:
                             sub = fix_df[fix_df["File Name"] == fname].reset_index(drop=True)
                             st.markdown(f"**{fname}** — {len(sub)} line(s) with a different HS")
@@ -1521,6 +1522,31 @@ def main():
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                     key=f"dl_fix_{fname}",
                                 )
+                                corrected_files.append((f"{stem}_HS_corrected.xlsx", new_bytes))
+
+                        # ── One big button: all corrected packing lists in a single ZIP ──
+                        if corrected_files:
+                            import zipfile
+                            zip_buf = io.BytesIO()
+                            used_names = set()
+                            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                                for _name, _data in corrected_files:
+                                    _n, _i = _name, 2
+                                    while _n in used_names:          # never overwrite a same-named file
+                                        _n = _name.replace(".xlsx", f"_{_i}.xlsx")
+                                        _i += 1
+                                    used_names.add(_n)
+                                    zf.writestr(_n, _data)
+                            st.markdown("---")
+                            st.download_button(
+                                label=f"⬇️ Download ALL corrected packing lists ({len(corrected_files)} files, ZIP)",
+                                data=zip_buf.getvalue(),
+                                file_name=f"HS_corrected_packing_lists_{date.today().isoformat()}.zip",
+                                mime="application/zip",
+                                type="primary",
+                                use_container_width=True,
+                                key="dl_fix_all_zip",
+                            )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
