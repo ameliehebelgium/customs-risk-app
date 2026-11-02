@@ -1102,7 +1102,7 @@ def _cc_check_sheet(ws):
                 break
 
     # 4) line by line
-    rows, n_lines = [], 0
+    rows, n_lines, linemap = [], 0, {}
     order = [f for f in _CC_LABELS if f in cols]
     for r in range(header_row + 1, last_row + 1):
         vals = {f: cell_value(r, cols[f]) for f in order}
@@ -1111,12 +1111,13 @@ def _cc_check_sheet(ws):
         if all(_cc_is_empty(v) for v in vals.values()):
             continue                                                         # spacer row
         n_lines += 1
+        linemap[r] = line_no(r)
         missing = [(f, cell_addr(r, cols[f])) for f in order if _cc_is_empty(vals[f])]
         if missing:
             d = vals.get("desc")
             rows.append({"row": r, "line": line_no(r),
                          "desc": "" if _cc_is_empty(d) else str(d).strip(), "missing": missing})
-    return rows, n_lines
+    return rows, n_lines, linemap
 
 
 @st.cache_data(show_spinner=False)
@@ -1124,13 +1125,14 @@ def check_empty_cells(file_bytes: bytes, filename: str):
     """Empty-cell check of one uploaded workbook — every sheet that holds a product table
     (a three-in-one file: invoice, packing list and contract are all checked).
     Merged cells are judged by the merged block's top-left value.
-    Returns (issues_df, sheet_line_counts {sheet: lines}, errors [text])."""
+    Returns (issues_df, sheet_line_counts {sheet: lines}, errors [text],
+             linemaps {sheet: {excel row: line No.}})."""
     import openpyxl
-    issues, counts, errors = [], {}, []
+    issues, counts, errors, linemaps = [], {}, [], {}
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     except Exception as e:
-        return pd.DataFrame(), {}, [f"{filename}: cannot open for the empty-cell check ({e})"]
+        return pd.DataFrame(), {}, [f"{filename}: cannot open for the empty-cell check ({e})"], {}
     for ws in wb.worksheets:
         try:
             res = _cc_check_sheet(ws)
@@ -1139,8 +1141,9 @@ def check_empty_cells(file_bytes: bytes, filename: str):
             continue
         if res is None:
             continue
-        rows, n_lines = res
+        rows, n_lines, lm = res
         counts[ws.title] = n_lines
+        linemaps[ws.title] = {r: n for r, n in lm.items() if n is not None}
         for it in rows:
             issues.append({
                 "File":        filename,
@@ -1151,7 +1154,42 @@ def check_empty_cells(file_bytes: bytes, filename: str):
                 "Empty":       "、".join(_CC_LABELS[f] for f, _ in it["missing"]),
                 "Cells":       ", ".join(a for _, a in it["missing"]),
             })
-    return pd.DataFrame(issues), counts, errors
+    return pd.DataFrame(issues), counts, errors, linemaps
+
+
+def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx, lookup, check_idx, fixed, ref_empty):
+    """Why the HS of a line was (not) changed — shown next to its empty cells."""
+    if ref_empty:
+        return "参照数据库为空，未核对 HS"
+    if not pl_sheet:
+        return "—"
+    if sheet == pl_sheet:
+        pl_row = row
+    else:                                   # invoice / contract: find the same line No. on the packing list
+        inv = {n: r for r, n in reversed(list(linemaps.get(pl_sheet, {}).items()))}
+        pl_row = inv.get(line) if line != "" else None
+    if pl_row is None:
+        return "箱单里找不到对应行号，未核对 HS"
+    d = doc_idx.get((fname, pl_row))
+    if d is None:
+        return "该行未被解析（描述或 HS 为空），未核对 HS"
+    sku = clean_text(d.get("SKU Number", "")).upper()
+    if not sku:
+        return "箱单该行无 SKU，未核对 HS"
+    if sku not in lookup:
+        return "参照数据库里无此 SKU（无信息，HS 未改）"
+    if (fname, pl_row) in fixed:
+        return "HS 已按参照数据库修改"
+    c = check_idx.get((fname, pl_row))
+    if c is None:
+        return "HS 与参照数据库一致，无需修改"
+    if c["Severity"] == "HSLEN":
+        return "参照库里此 SKU 的 HS 位数异常，HS 未改"
+    if c["Cmp HS"] == "diff":
+        return "HS 与参照不同，但未修改（未勾选或无法自动改）"
+    if c["Cmp HS"] == "na":
+        return "参照库有此 SKU，但无 HS 信息，HS 未改"
+    return "HS 与参照数据库一致，无需修改（仅描述有差异）"
 
 
 def render_empty_cell_alert(results: list):
@@ -1170,6 +1208,7 @@ def render_empty_cell_alert(results: list):
              for n, _df, cnt, e_list in results if not cnt and not e_list]
 
     st.markdown("#### 🔍 Empty-cell check / 空格检查")
+    st.caption("检查的是 HS 修改覆盖之后的文件（与下载的文件一致）；没有被修改的文件按原文件检查。")
     if not total_rows:
         st.success(f"✅ {len(results)} 个文件的所有表、所有产品行（行号、描述、HS、数量、箱数、GW、NW、SKU、价值…）均无空格。")
     else:
@@ -1701,13 +1740,13 @@ def main():
         zip_slot = st.container()
 
         if doc_files:
+            document_df, check_df, sku_lookup, ref_empty = None, None, {}, False
+            fixed_rows = set()   # (file, packing-list Excel row) whose HS was changed
             all_doc_rows = []
             file_bytes = {}
-            empty_results = []
+            final_bytes = {}     # what the user will actually download: corrected file if HS was changed, else the original
             for file in doc_files:
                 file_bytes[file.name] = file.getvalue()
-                _iss, _cnt, _err = check_empty_cells(file_bytes[file.name], file.name)
-                empty_results.append((file.name, _iss, _cnt, _err))
                 doc_df = normalize_document_file(file)
                 doc_df["_File"] = file.name
                 try:
@@ -1721,9 +1760,6 @@ def main():
                 else:
                     st.warning(f"No valid product / HS lines detected in {file.name}.")
 
-            with empty_slot:
-                render_empty_cell_alert(empty_results)
-
             if all_doc_rows:
                 document_df = pd.concat(all_doc_rows, ignore_index=True)
                 with st.expander("📄 Preview parsed packing list lines"):
@@ -1731,8 +1767,10 @@ def main():
 
                 ref_df = load_reference_db()
                 if len(ref_df) == 0:
+                    ref_empty = True
                     st.warning("Reference database is empty. Please import data first (Tab 2).")
                 else:
+                    sku_lookup = build_sku_lookup(ref_df)
                     check_df = check_packing_list_against_reference(document_df, ref_df)
 
                     if len(check_df) == 0:
@@ -1837,6 +1875,11 @@ def main():
                                 st.caption("Three-in-one file: the same HS correction is made on the invoice, packing list and "
                                            "contract (same line No. and same description), each changed cell in yellow.")
                             if applied:
+                                _skip_rows = {int(re.sub(r"\D", "", str(c).split("!")[-1]) or 0) for c, _w in skipped
+                                              if str(c).startswith(str(chosen.iloc[0]["Sheet"]) + "!")}
+                                fixed_rows |= {(fname, int(r["HS Row"])) for _, r in chosen.iterrows()
+                                               if int(r["HS Row"]) not in _skip_rows}
+                                final_bytes[fname] = new_bytes
                                 stem = fname.rsplit(".", 1)[0]
                                 st.download_button(
                                     label=f"⬇️ Download corrected packing list — {fname}",
@@ -1870,6 +1913,41 @@ def main():
                                     use_container_width=True,
                                     key="dl_fix_all_zip",
                                 )
+
+            # ── Empty-cell check: runs LAST, on the files after the HS correction ──
+            doc_idx = {}
+            if document_df is not None:
+                for _, _r in document_df.iterrows():
+                    try:
+                        doc_idx[(_r["_File"], int(_r["_HS_Row"]))] = _r
+                    except Exception:
+                        pass
+            check_idx = {}
+            if check_df is not None and len(check_df):
+                for _, _r in check_df.iterrows():
+                    try:
+                        check_idx[(_r["File Name"], int(_r["HS Row"]))] = _r
+                    except Exception:
+                        pass
+            pl_sheet_of = {}
+            if document_df is not None:
+                for _f, _g in document_df.groupby("_File"):
+                    _s = [x for x in _g["_Sheet"].astype(str).unique() if x]
+                    pl_sheet_of[_f] = _s[0] if _s else ""
+
+            empty_results = []
+            for _fname, _orig in file_bytes.items():
+                _iss, _cnt, _err, _lm = check_empty_cells(final_bytes.get(_fname, _orig), _fname)
+                if len(_iss):
+                    _iss = _iss.copy()
+                    _iss["HS 核对结果"] = [
+                        hs_status_for_empty_row(_fname, x["Sheet"], x["Excel row"], x["Line No"],
+                                                pl_sheet_of.get(_fname, ""), _lm, doc_idx, sku_lookup,
+                                                check_idx, fixed_rows, ref_empty)
+                        for _, x in _iss.iterrows()]
+                empty_results.append((_fname, _iss, _cnt, _err))
+            with empty_slot:
+                render_empty_cell_alert(empty_results)
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
