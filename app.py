@@ -763,30 +763,32 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
 # ════════════════════════════════════════════════════════════════════════════════
 
 def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, context: list = None):
-    """Write corrected HS codes into the ORIGINAL workbook and paint those cells yellow.
+    """Write corrected HS codes into the ORIGINAL workbook and paint the changed cells yellow.
 
-    edits: list of (excel_row, column_letter, new_hs) — one per packing-list line.
-    context: same shape, for lines that are NOT being changed but whose reference HS is known.
-             If such a line shares the HS cell with an edited line and needs a different HS,
-             the cell is left untouched (reported as a conflict) — otherwise fixing one line
-             would break the other and every re-upload would flip the cell back and forth.
-    Sub-SKU lines share the HS cell of their product row (merged or blank cells below it);
-    the edit goes to that product-row cell. If SKUs under one product need different HS
-    codes the cell is left untouched and reported as a conflict.
+    edits:   list of (excel_row, column_letter, new_hs) — one per packing-list line to change.
+    context: same shape, for the OTHER lines of the sheet (new_hs = their reference HS, or ''
+             when unknown). They are never changed; they are only used to see which lines share
+             an HS cell (merged cells, or blank cells below a product row) with an edited line.
 
-    The workbook XML is patched in place (one cell value + one new style), so formulas,
-    other sheets, widths, merges and formatting are untouched.
+    Lines that share one HS cell and all need the same HS: that cell is changed.
+    Lines that share one HS cell but need DIFFERENT HS codes: the merged cell is split
+    (un-merged) and every line gets its own HS cell — the edited lines the reference HS (yellow),
+    the others keep the HS they had. This is the only way to give each SKU its own HS.
+
+    The workbook XML is patched in place (cell values + new styles + merge list), so formulas,
+    other sheets, widths and formatting are untouched.
     Returns (new_bytes, applied, skipped); applied = [(cell, old, new, n_lines)],
     skipped = [(cell, reason)].
     """
     import io, re, zipfile
     import openpyxl
+    from openpyxl.utils import column_index_from_string
     from xml.sax.saxutils import escape as _esc
 
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     ws = wb[sheet_name]
 
-    # 1) resolve each edit to the cell that really holds the HS value
+    # 1) resolve each line to the cell that really holds its HS value
     def _target_cell(row, col):
         coord = f"{col}{int(row)}"
         for mr in ws.merged_cells.ranges:
@@ -797,19 +799,20 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, contex
             r -= 1
         return f"{col}{r}"
 
-    targets, ctx_targets = {}, {}
+    targets, ctx_targets = {}, {}          # coord -> [(row, col, hs)]
     for row, col, new_hs in edits:
-        targets.setdefault(_target_cell(row, col), []).append(clean_hs(new_hs))
+        targets.setdefault(_target_cell(row, col), []).append((int(row), col, clean_hs(new_hs)))
     for row, col, ref_hs in (context or []):
-        ctx_targets.setdefault(_target_cell(row, col), []).append(clean_hs(ref_hs))
+        ctx_targets.setdefault(_target_cell(row, col), []).append((int(row), col, clean_hs(ref_hs)))
 
-    applied, skipped, todo = [], [], {}
-    for coord, vals in targets.items():
+    applied, skipped, todo, splits = [], [], {}, []
+    for coord, items in targets.items():
         old = clean_hs(ws[coord].value)
-        allv = set(vals) | set(ctx_targets.get(coord, []))
+        vals = [v for _, _, v in items]
+        ctx_items = ctx_targets.get(coord, [])
+        allv = set(vals) | {v for _, _, v in ctx_items if v}
         if len(allv) > 1:
-            skipped.append((coord, "SKUs sharing this HS cell need different HS codes: " + ", ".join(sorted(allv))
-                            + " — split the merged / shared HS cell by hand"))
+            splits.append((coord, old, items, ctx_items))
         elif vals[0] == old:
             skipped.append((coord, "already has this HS"))
         elif not vals[0]:
@@ -818,12 +821,35 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, contex
             todo[coord] = vals[0]
             applied.append((coord, old, vals[0], len(vals)))
 
-    if not todo:
+    # 2) plan the splits: every line under a shared cell gets its own HS cell
+    writes = {}        # coord -> (text, yellow)
+    unmerge = []       # merged ranges to remove
+    for coord, old, items, ctx_items in splits:
+        col = re.sub(r"\d", "", coord)
+        top = int(re.sub(r"\D", "", coord))
+        new_by_row = {r: v for r, _, v in items}
+        rows = set(new_by_row) | {r for r, _, _ in ctx_items} | {top}
+        merged_here = False
+        for mr in ws.merged_cells.ranges:
+            if coord in mr:
+                unmerge.append(str(mr))
+                rows |= set(range(mr.min_row, mr.max_row + 1))
+                merged_here = True
+                break
+        for r in sorted(rows):
+            want = new_by_row.get(r) or old
+            changed = want != old
+            if r == top and not changed and not merged_here:
+                continue
+            writes[f"{col}{r}"] = (want, changed)
+            if changed:
+                applied.append((f"{col}{r}", old, want, "split"))
+
+    if not todo and not writes:
         return file_bytes, applied, skipped
 
-    # 2) patch the XML
+    # 3) patch the XML
     zin = zipfile.ZipFile(io.BytesIO(file_bytes))
-    names = zin.namelist()
     wbxml = zin.read("xl/workbook.xml").decode("utf-8")
     rels  = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
     m = None
@@ -867,15 +893,65 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, contex
             style_map[s_idx] = len(xfs) + len(new_xfs) - 1
         return style_map[s_idx]
 
+    def _find_cell(coord):
+        return re.search(r'<c r="' + coord + r'"([^>]*?)(/>|>.*?</c>)', sheet_xml, re.S)
+
+    def _style_idx(coord, fallback=0):
+        cm = _find_cell(coord)
+        if cm:
+            sm_ = re.search(r'\bs="(\d+)"', cm.group(1))
+            if sm_:
+                return int(sm_.group(1))
+        return fallback
+
+    def put_cell(coord, text, yellow, fallback_s):
+        nonlocal sheet_xml
+        base = _style_idx(coord, fallback_s)
+        s_idx = yellow_style(base) if yellow else base
+        cell = f'<c r="{coord}" s="{s_idx}" t="inlineStr"><is><t>{_esc(text)}</t></is></c>'
+        cm = _find_cell(coord)
+        if cm:
+            sheet_xml = sheet_xml[:cm.start()] + cell + sheet_xml[cm.end():]
+            return
+        col = re.sub(r"\d", "", coord)
+        rown = int(re.sub(r"\D", "", coord))
+        rm = re.search(r'<row r="%d"([^>]*?)(/>|>(.*?)</row>)' % rown, sheet_xml, re.S)
+        if rm is None:
+            raise RuntimeError(f"row {rown} not found in sheet XML")
+        if rm.group(2) == "/>":
+            new_row = f'<row r="{rown}"{rm.group(1)}>{cell}</row>'
+        else:
+            inner = rm.group(3)
+            pos = len(inner)
+            for c2 in re.finditer(r'<c r="([A-Z]+)%d"' % rown, inner):
+                if column_index_from_string(c2.group(1)) > column_index_from_string(col):
+                    pos = c2.start()
+                    break
+            new_row = f'<row r="{rown}"{rm.group(1)}>{inner[:pos]}{cell}{inner[pos:]}</row>'
+        sheet_xml = sheet_xml[:rm.start()] + new_row + sheet_xml[rm.end():]
+
+    # splits: remove the merge first, remember the style of the old top-left cell
+    top_style = {}
+    for coord, *_ in splits:
+        top_style[re.sub(r"\d", "", coord)] = _style_idx(coord, 0)
+    for ref in unmerge:
+        sheet_xml, n_rm = re.subn(r'<mergeCell\s+ref="%s"\s*/>' % re.escape(ref), "", sheet_xml)
+        mc = re.search(r'<mergeCells count="(\d+)"', sheet_xml)
+        if mc and n_rm:
+            left = int(mc.group(1)) - n_rm
+            if left <= 0:
+                sheet_xml = re.sub(r'<mergeCells[^>]*>\s*</mergeCells>', "", sheet_xml)
+            else:
+                sheet_xml = sheet_xml.replace(mc.group(0), f'<mergeCells count="{left}"', 1)
+    for coord, (text, yellow) in writes.items():
+        col = re.sub(r"\d", "", coord)
+        put_cell(coord, text, yellow, top_style.get(col, 0))
+
+    # plain case: one shared cell, one HS for everybody
     for coord, new_hs in todo.items():
-        cm = re.search(r'<c r="' + coord + r'"([^>]*?)(/>|>.*?</c>)', sheet_xml, re.S)
-        if cm is None:
+        if _find_cell(coord) is None:
             raise RuntimeError(f"cell {coord} not found in sheet XML")
-        attrs = cm.group(1)
-        sm_ = re.search(r'\bs="(\d+)"', attrs)
-        s_new = yellow_style(int(sm_.group(1)) if sm_ else 0)
-        cell = f'<c r="{coord}" s="{s_new}" t="inlineStr"><is><t>{_esc(new_hs)}</t></is></c>'
-        sheet_xml = sheet_xml[:cm.start()] + cell + sheet_xml[cm.end():]
+        put_cell(coord, new_hs, True, 0)
 
     styles_xml = styles_xml.replace(
         xm.group(0),
@@ -1208,6 +1284,75 @@ def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx
     if c["Cmp HS"] == "na":
         return "参照库有此 SKU，但无 HS 信息，HS 未改"
     return "HS 与参照数据库一致，无需修改（仅描述有差异）"
+
+
+def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_log) -> bytes:
+    """One Excel file with everything the app flagged, for side-by-side comparison."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    sheets = {}
+    frames = [df for _, df, _, _ in empty_results if len(df)]
+    if frames:
+        sheets["空格检查"] = pd.concat(frames, ignore_index=True).rename(columns={
+            "File": "文件", "Sheet": "Sheet", "Excel row": "Excel 行", "Line No": "行号 No.",
+            "Description": "产品描述", "Empty": "空的字段", "Cells": "空的单元格"})
+    cnt_rows = []
+    for fname, _df, counts, _e in empty_results:
+        if len(set(counts.values())) > 1:
+            cnt_rows += [{"文件": fname, "Sheet": sh, "产品行数": n} for sh, n in counts.items()]
+    if cnt_rows:
+        sheets["各表行数不一致"] = pd.DataFrame(cnt_rows)
+    if check_df is not None and len(check_df):
+        d = check_df.copy()
+        split_cells = {(x["File"], x["Cell"]) for x in change_log if "拆分" in x["Action"]}
+        res = []
+        for _, r in d.iterrows():
+            key = (r["File Name"], int(r["HS Row"])) if str(r["HS Row"]) != "" else None
+            cell = f"{r['Sheet']}!{r['HS Col']}{r['HS Row']}"
+            if key in fixed_rows:
+                res.append("已修改（拆分合并格）" if (r["File Name"], cell) in split_cells else "已修改为参照 HS")
+            elif r["Severity"] == "HSLEN":
+                res.append("未修改：参照库 HS 位数异常")
+            elif r["Cmp HS"] == "diff":
+                res.append("未修改（未勾选，或无法自动改）")
+            else:
+                res.append("HS 一致，仅描述等有差异")
+        d["处理结果"] = res
+        sheets["HS差异与处理"] = d[["File Name", "Sheet", "HS Row", "Line No", "SKU", "PL Description", "PL HS Code",
+                                   "Ref HS Code", "Ref Duty Rate", "Severity", "Reason", "处理结果"]].rename(columns={
+            "File Name": "文件", "HS Row": "Excel 行", "Line No": "行序", "PL Description": "箱单描述",
+            "PL HS Code": "箱单 HS", "Ref HS Code": "参照库 HS", "Ref Duty Rate": "参照税率",
+            "Severity": "级别", "Reason": "原因"})
+    if change_log:
+        sheets["改动明细"] = pd.DataFrame(change_log).rename(columns={
+            "File": "文件", "Cell": "单元格", "Old HS": "原 HS", "New HS": "新 HS", "Action": "操作"})
+    skip_df = pd.DataFrame([x for x in skip_log if "already has" not in x["Reason"]])
+    if len(skip_df):
+        sheets["未改动的格"] = skip_df.rename(columns={"File": "文件", "Cell": "单元格", "Reason": "原因"})
+    if not sheets:
+        return b""
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for name, df in sheets.items():
+        ws = wb.create_sheet(name)
+        ws.append(list(df.columns))
+        for row in df.astype(object).where(df.notna(), "").values.tolist():
+            ws.append(row)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid", fgColor="DDDDDD")
+            c.alignment = Alignment(vertical="center")
+        for i, col in enumerate(df.columns, 1):
+            width = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)]) + 2
+            ws.column_dimensions[get_column_letter(i)].width = min(max(width, 8), 60)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def render_empty_cell_alert(results: list):
@@ -1765,6 +1910,7 @@ def main():
         if doc_files:
             document_df, check_df, sku_lookup, ref_empty = None, None, {}, False
             fixed_rows = set()   # (file, packing-list Excel row) whose HS was changed
+            change_log, skip_log = [], []   # for the downloadable error table
             all_doc_rows = []
             file_bytes = {}
             final_bytes = {}     # what the user will actually download: corrected file if HS was changed, else the original
@@ -1891,10 +2037,13 @@ def main():
                                     _row = int(_d["_HS_Row"])
                                 except Exception:
                                     continue
+                                if _row in _chosen_rows:
+                                    continue
                                 _ref = sku_lookup.get(clean_text(_d["SKU Number"]).upper())
                                 _h = clean_hs(_ref.get("Customs Commodity Code", "")) if _ref else ""
-                                if _row not in _chosen_rows and _h and not hs_len_abnormal(_h):
-                                    _ctx.append((_row, _d["_HS_Col"], _h))
+                                if hs_len_abnormal(_h):
+                                    _h = ""
+                                _ctx.append((_row, _d["_HS_Col"], _h))     # '' = reference unknown, line is left as it is
                             try:
                                 new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
                                     file_bytes[fname], chosen.iloc[0]["Sheet"],
@@ -1904,8 +2053,17 @@ def main():
                             except Exception as e:
                                 st.error(f"Could not edit {fname}: {e}")
                                 continue
+                            for c, o, n, k in applied:
+                                change_log.append({"File": fname, "Cell": c, "Old HS": o, "New HS": n,
+                                                   "Action": "拆分合并格后修改（每个 SKU 各写各的 HS）" if k == "split" else "修改 HS"})
+                            for cell, why in skipped:
+                                skip_log.append({"File": fname, "Cell": cell, "Reason": why})
                             if applied:
                                 st.caption("Changed cells: " + ", ".join(f"{c} ({o} → {n})" for c, o, n, _ in applied))
+                            _split_cells = [c for c, o, n, k in applied if k == "split"]
+                            if _split_cells:
+                                st.info(f"🔀 **{fname}**: 合并格已拆开，每个 SKU 各写各的 HS（改动的格标黄）— "
+                                        + ", ".join(_split_cells))
                             for cell, why in skipped:
                                 st.warning(f"Cell {cell} left unchanged — {why}")
                             if len(pd.ExcelFile(io.BytesIO(file_bytes[fname])).sheet_names) > 1:
@@ -1989,6 +2147,15 @@ def main():
                 empty_results.append((_fname, _iss, _cnt, _err))
             with empty_slot:
                 render_empty_cell_alert(empty_results)
+                _xl_bytes = build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_log)
+                if _xl_bytes:
+                    st.download_button(
+                        "⬇️ Download all errors as Excel / 下载错误明细 Excel（空格、HS 差异、改动、未改动原因）",
+                        data=_xl_bytes,
+                        file_name=f"RiskCheck_errors_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_error_table",
+                    )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
