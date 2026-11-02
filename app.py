@@ -995,6 +995,196 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
     return new_bytes, applied, skipped
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# EMPTY-CELL CHECK  (every sheet of every uploaded file, every product column)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# field key -> label shown in the reminder (order = display order)
+_CC_LABELS = {
+    "no": "行号 No.", "sku": "SKU", "desc": "产品描述 Description", "hs": "HS",
+    "origin": "原产国 Origin", "qty": "数量 Qty", "ctns": "箱数 CTNS",
+    "gw": "毛重 GW", "nw": "净重 NW", "cbm": "体积 CBM",
+    "unit": "单价 Unit price", "total": "总价 Total",
+}
+
+
+def _cc_classify(header) -> str:
+    """Which product field a table-header cell stands for ('' = not a product column)."""
+    if not isinstance(header, str):
+        return ""
+    t = re.sub(r"\s+", "", header).lower()
+    if not t:
+        return ""
+    if re.fullmatch(r"(no\.?|序号|itemno\.?|line)", t):                      return "no"
+    if t.startswith("sku"):                                                  return "sku"
+    if "total" in t and re.search(r"value|price|amount|usd|eur", t) or t in ("amount", "总价", "金额"):
+        return "total"
+    if ("unit" in t and re.search(r"value|price", t)) or "单价" in t:         return "unit"
+    if "desc" in t or "英文申报名称" in t or "品名" in t or "productname" in t: return "desc"
+    if re.match(r"(hs|hts)\b|hscode|海关编码|commodity|出口hs", t):          return "hs"
+    if "origin" in t or "原产" in t:                                         return "origin"
+    if re.match(r"g\.?w\b|gross|毛重", t):                                   return "gw"
+    if re.match(r"n\.?w\b|net|净重", t):                                     return "nw"
+    if re.match(r"cbm|volume|体积|m3|m³", t):                                return "cbm"
+    if re.match(r"(ctns?|cartons?|packages?|箱数|件数)", t):                  return "ctns"
+    if re.match(r"(qty|quantity|pcs|pieces|数量)", t):                       return "qty"
+    return ""
+
+
+def _cc_is_empty(v) -> bool:
+    return v is None or str(v).strip().lower() in ("", "nan", "none")
+
+
+def _cc_check_sheet(ws):
+    """Scan one sheet. Returns (rows, line_count) or None when it has no product table.
+    rows = [{'row', 'line', 'desc', 'missing': [(field, cell address), ...]}]"""
+    from openpyxl.utils import get_column_letter
+
+    # merged cell -> the top-left cell that really holds the value
+    top_of = {}
+    for mr in ws.merged_cells.ranges:
+        tl = mr.start_cell.coordinate
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                top_of[(r, c)] = tl
+
+    def cell_value(r, c):
+        tl = top_of.get((r, c))
+        return ws[tl].value if tl else ws.cell(r, c).value
+
+    def cell_addr(r, c):
+        return top_of.get((r, c)) or f"{get_column_letter(c)}{r}"
+
+    # 1) header row: needs a description column and an HS column plus at least one more field
+    header_row, cols = None, {}
+    for r in range(1, min(ws.max_row, 40) + 1):
+        found = {}
+        for c in range(1, ws.max_column + 1):
+            f = _cc_classify(cell_value(r, c))
+            if f and f not in found:
+                found[f] = c
+        if "desc" in found and "hs" in found and len(found) >= 3:
+            header_row, cols = r, found
+            break
+    if header_row is None:
+        return None
+
+    # 2) table body: down to the 'total' row, or the last numbered line
+    last_row = ws.max_row
+    for r in range(header_row + 1, ws.max_row + 1):
+        texts = [str(cell_value(r, c)).strip().lower() for c in range(1, ws.max_column + 1)
+                 if isinstance(cell_value(r, c), str)]
+        if any(re.match(r"(grand\s*)?total\b|合计|总计", s) and len(s) < 30 for s in texts):
+            last_row = r - 1
+            break
+
+    def line_no(r):
+        if "no" not in cols:
+            return None
+        try:
+            return int(float(str(cell_value(r, cols["no"])).strip()))
+        except Exception:
+            return None
+
+    if "no" in cols:
+        numbered = [r for r in range(header_row + 1, last_row + 1) if line_no(r) is not None]
+        if numbered:
+            last_row = numbered[-1]
+
+    # 3) packing lists often carry the SKU in a column without a header, right of the table
+    if "sku" not in cols and ({"gw", "nw", "ctns"} & set(cols)):
+        for c in range(max(cols.values()) + 1, ws.max_column + 1):
+            vals = [str(cell_value(r, c)).strip() for r in range(header_row + 1, last_row + 1)
+                    if not _cc_is_empty(cell_value(r, c))]
+            looks = [v for v in vals if len(v) >= 8 and re.search(r"[A-Za-z]", v) and re.search(r"\d", v)]
+            if vals and len(looks) >= 0.8 * len(vals):
+                cols["sku"] = c
+                break
+
+    # 4) line by line
+    rows, n_lines = [], 0
+    order = [f for f in _CC_LABELS if f in cols]
+    for r in range(header_row + 1, last_row + 1):
+        vals = {f: cell_value(r, cols[f]) for f in order}
+        if str(vals.get("no", "")).strip().lower() in ("no", "no.", "序号"):   # repeated header
+            continue
+        if all(_cc_is_empty(v) for v in vals.values()):
+            continue                                                         # spacer row
+        n_lines += 1
+        missing = [(f, cell_addr(r, cols[f])) for f in order if _cc_is_empty(vals[f])]
+        if missing:
+            d = vals.get("desc")
+            rows.append({"row": r, "line": line_no(r),
+                         "desc": "" if _cc_is_empty(d) else str(d).strip(), "missing": missing})
+    return rows, n_lines
+
+
+@st.cache_data(show_spinner=False)
+def check_empty_cells(file_bytes: bytes, filename: str):
+    """Empty-cell check of one uploaded workbook — every sheet that holds a product table
+    (a three-in-one file: invoice, packing list and contract are all checked).
+    Merged cells are judged by the merged block's top-left value.
+    Returns (issues_df, sheet_line_counts {sheet: lines}, errors [text])."""
+    import openpyxl
+    issues, counts, errors = [], {}, []
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    except Exception as e:
+        return pd.DataFrame(), {}, [f"{filename}: cannot open for the empty-cell check ({e})"]
+    for ws in wb.worksheets:
+        try:
+            res = _cc_check_sheet(ws)
+        except Exception as e:
+            errors.append(f"{filename} / {ws.title}: check failed ({e})")
+            continue
+        if res is None:
+            continue
+        rows, n_lines = res
+        counts[ws.title] = n_lines
+        for it in rows:
+            issues.append({
+                "File":        filename,
+                "Sheet":       ws.title,
+                "Excel row":   it["row"],
+                "Line No":     "" if it["line"] is None else it["line"],
+                "Description": it["desc"],
+                "Empty":       "、".join(_CC_LABELS[f] for f, _ in it["missing"]),
+                "Cells":       ", ".join(a for _, a in it["missing"]),
+            })
+    return pd.DataFrame(issues), counts, errors
+
+
+def render_empty_cell_alert(results: list):
+    """results = [(filename, issues_df, sheet_line_counts, errors)] → one reminder block."""
+    total_cells = sum(int(df["Cells"].str.count(",").add(1).sum()) for _, df, _, _ in results if len(df))
+    total_rows  = sum(len(df) for _, df, _, _ in results)
+    bad_files   = [n for n, df, _, _ in results if len(df)]
+
+    count_notes = []
+    for fname, _df, counts, _e in results:
+        if len(set(counts.values())) > 1:
+            count_notes.append(f"**{fname}** — 各表产品行数不一致: "
+                               + "，".join(f"{s} {n} 行" for s, n in counts.items()))
+    errs = [e for _, _, _, e_list in results for e in e_list]
+    errs += [f"{n}: 未识别到产品表格（表头需含描述和 HS 列），此文件未做空格检查"
+             for n, _df, cnt, e_list in results if not cnt and not e_list]
+
+    st.markdown("#### 🔍 Empty-cell check / 空格检查")
+    if not total_rows:
+        st.success(f"✅ {len(results)} 个文件的所有表、所有产品行（行号、描述、HS、数量、箱数、GW、NW、SKU、价值…）均无空格。")
+    else:
+        st.warning(f"⚠️ 发现 **{total_cells}** 个空格，分布在 **{total_rows}** 行 / {len(bad_files)} 个文件 — 请先补全再清关。")
+        for fname, df, counts, _e in results:
+            if not len(df):
+                continue
+            with st.expander(f"📄 {fname} — {len(df)} 行有空格", expanded=True):
+                st.dataframe(df.drop(columns=["File"]), use_container_width=True, hide_index=True)
+    for note in count_notes:
+        st.warning("📏 " + note)
+    for e in errs:
+        st.caption("ℹ️ " + e)
+
+
 def build_card_html(row, border: str, bg: str, icon: str) -> str:
     """Side-by-side comparison card: DATABASE (left) vs PACKING LIST (right), one aligned
     row per field. Differences are highlighted in red, matches in green."""
@@ -1503,15 +1693,21 @@ def main():
                         del st.session_state[_k]
                 st.rerun()
 
-        # Placeholder right under the uploader: the "download all" button is filled in
+        # Empty-cell reminder: sits between the uploader and the "download all" button.
+        empty_slot = st.container()
+
+        # Placeholder right under the reminder: the "download all" button is filled in
         # here later, once the corrected files exist, so it shows at the top of the results.
         zip_slot = st.container()
 
         if doc_files:
             all_doc_rows = []
             file_bytes = {}
+            empty_results = []
             for file in doc_files:
                 file_bytes[file.name] = file.getvalue()
+                _iss, _cnt, _err = check_empty_cells(file_bytes[file.name], file.name)
+                empty_results.append((file.name, _iss, _cnt, _err))
                 doc_df = normalize_document_file(file)
                 doc_df["_File"] = file.name
                 try:
@@ -1524,6 +1720,9 @@ def main():
                     all_doc_rows.append(doc_df)
                 else:
                     st.warning(f"No valid product / HS lines detected in {file.name}.")
+
+            with empty_slot:
+                render_empty_cell_alert(empty_results)
 
             if all_doc_rows:
                 document_df = pd.concat(all_doc_rows, ignore_index=True)
