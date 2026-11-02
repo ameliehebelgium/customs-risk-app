@@ -762,10 +762,14 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
 # PDF EXPORT
 # ════════════════════════════════════════════════════════════════════════════════
 
-def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list):
+def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, context: list = None):
     """Write corrected HS codes into the ORIGINAL workbook and paint those cells yellow.
 
     edits: list of (excel_row, column_letter, new_hs) — one per packing-list line.
+    context: same shape, for lines that are NOT being changed but whose reference HS is known.
+             If such a line shares the HS cell with an edited line and needs a different HS,
+             the cell is left untouched (reported as a conflict) — otherwise fixing one line
+             would break the other and every re-upload would flip the cell back and forth.
     Sub-SKU lines share the HS cell of their product row (merged or blank cells below it);
     the edit goes to that product-row cell. If SKUs under one product need different HS
     codes the cell is left untouched and reported as a conflict.
@@ -783,25 +787,29 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list):
     ws = wb[sheet_name]
 
     # 1) resolve each edit to the cell that really holds the HS value
-    targets = {}
-    for row, col, new_hs in edits:
+    def _target_cell(row, col):
         coord = f"{col}{int(row)}"
         for mr in ws.merged_cells.ranges:
             if coord in mr:
-                coord = mr.start_cell.coordinate
-                break
-        else:
-            r = int(row)
-            while r > 1 and ws[f"{col}{r}"].value in (None, ""):
-                r -= 1
-            coord = f"{col}{r}"
-        targets.setdefault(coord, []).append(clean_hs(new_hs))
+                return mr.start_cell.coordinate
+        r = int(row)
+        while r > 1 and ws[f"{col}{r}"].value in (None, ""):
+            r -= 1
+        return f"{col}{r}"
+
+    targets, ctx_targets = {}, {}
+    for row, col, new_hs in edits:
+        targets.setdefault(_target_cell(row, col), []).append(clean_hs(new_hs))
+    for row, col, ref_hs in (context or []):
+        ctx_targets.setdefault(_target_cell(row, col), []).append(clean_hs(ref_hs))
 
     applied, skipped, todo = [], [], {}
     for coord, vals in targets.items():
         old = clean_hs(ws[coord].value)
-        if len(set(vals)) > 1:
-            skipped.append((coord, "SKUs under this product need different HS codes: " + ", ".join(sorted(set(vals)))))
+        allv = set(vals) | set(ctx_targets.get(coord, []))
+        if len(allv) > 1:
+            skipped.append((coord, "SKUs sharing this HS cell need different HS codes: " + ", ".join(sorted(allv))
+                            + " — split the merged / shared HS cell by hand"))
         elif vals[0] == old:
             skipped.append((coord, "already has this HS"))
         elif not vals[0]:
@@ -928,7 +936,7 @@ def _line_rows(ws, tbl) -> dict:
     return out
 
 
-def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: list):
+def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: list, pl_context: list = None):
     """Apply the packing-list HS corrections AND mirror them on the other sheets of a
     three-in-one workbook (invoice / contract): same line No. -> same HS, cell painted yellow.
 
@@ -938,7 +946,7 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
     """
     import io, openpyxl
 
-    new_bytes, applied_pl, skipped_pl = apply_hs_corrections(file_bytes, pl_sheet, pl_edits)
+    new_bytes, applied_pl, skipped_pl = apply_hs_corrections(file_bytes, pl_sheet, pl_edits, pl_context)
     applied = [(f"{pl_sheet}!{c}", o, n, k) for c, o, n, k in applied_pl]
     skipped = [(f"{pl_sheet}!{c}", why) for c, why in skipped_pl]
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
@@ -983,10 +991,20 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
                 skipped.append((name, f"line No. {n}: HS is a formula — left unchanged"))
                 continue
             edits.append((r, tbl["hs_col"], new_hs))
+        ctx = []
+        for row, _col, ref_hs in (pl_context or []):          # unchanged lines: only used to detect shared-cell conflicts
+            try:
+                n = int(float(str(pl_ws[f"{pl_tbl['no_col']}{int(row)}"].value).strip()))
+            except Exception:
+                continue
+            r = rows_by_no.get(n)
+            if r is not None and _norm(_merged_top_value(pl_ws, f"{pl_tbl['desc_col']}{int(row)}")) == \
+                    _norm(_merged_top_value(ws, f"{tbl['desc_col']}{r}")):
+                ctx.append((r, tbl["hs_col"], ref_hs))
         if not edits:
             continue
         try:
-            new_bytes, a, sk = apply_hs_corrections(new_bytes, name, edits)
+            new_bytes, a, sk = apply_hs_corrections(new_bytes, name, edits, ctx)
         except Exception as e:
             skipped.append((name, f"could not edit this sheet: {e}"))
             continue
@@ -1222,6 +1240,11 @@ def render_empty_cell_alert(results: list):
         st.warning("📏 " + note)
     for e in errs:
         st.caption("ℹ️ " + e)
+
+
+class _NamedBytes(io.BytesIO):
+    """In-memory file with a .name, like a Streamlit upload."""
+    name = ""
 
 
 def build_card_html(row, border: str, bg: str, icon: str) -> str:
@@ -1859,10 +1882,24 @@ def main():
                             if len(chosen) == 0:
                                 st.caption("No line selected.")
                                 continue
+                            # lines of this file that are left as they are but have a known reference HS:
+                            # they must not be broken by a change to a HS cell they share with a corrected line
+                            _chosen_rows = {int(r["HS Row"]) for _, r in chosen.iterrows()}
+                            _ctx = []
+                            for _, _d in document_df[document_df["_File"] == fname].iterrows():
+                                try:
+                                    _row = int(_d["_HS_Row"])
+                                except Exception:
+                                    continue
+                                _ref = sku_lookup.get(clean_text(_d["SKU Number"]).upper())
+                                _h = clean_hs(_ref.get("Customs Commodity Code", "")) if _ref else ""
+                                if _row not in _chosen_rows and _h and not hs_len_abnormal(_h):
+                                    _ctx.append((_row, _d["_HS_Col"], _h))
                             try:
                                 new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
                                     file_bytes[fname], chosen.iloc[0]["Sheet"],
                                     [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()],
+                                    _ctx,
                                 )
                             except Exception as e:
                                 st.error(f"Could not edit {fname}: {e}")
@@ -1875,10 +1912,14 @@ def main():
                                 st.caption("Three-in-one file: the same HS correction is made on the invoice, packing list and "
                                            "contract (same line No. and same description), each changed cell in yellow.")
                             if applied:
-                                _skip_rows = {int(re.sub(r"\D", "", str(c).split("!")[-1]) or 0) for c, _w in skipped
-                                              if str(c).startswith(str(chosen.iloc[0]["Sheet"]) + "!")}
-                                fixed_rows |= {(fname, int(r["HS Row"])) for _, r in chosen.iterrows()
-                                               if int(r["HS Row"]) not in _skip_rows}
+                                try:     # a line counts as fixed when its HS in the corrected file equals the reference HS
+                                    _nf = _NamedBytes(new_bytes); _nf.name = fname
+                                    _nd = normalize_document_file(_nf)
+                                    _now = {int(a): clean_hs(b) for a, b in zip(_nd["_HS_Row"], _nd["HS Code"]) if str(a) != ""}
+                                    fixed_rows |= {(fname, int(r["HS Row"])) for _, r in chosen.iterrows()
+                                                   if _now.get(int(r["HS Row"])) == clean_hs(r["Ref HS Code"])}
+                                except Exception:
+                                    pass
                                 final_bytes[fname] = new_bytes
                                 stem = fname.rsplit(".", 1)[0]
                                 st.download_button(
@@ -1968,7 +2009,13 @@ def main():
             )
             if uploaded_ref is not None:
                 try:
-                    imp_df = pd.read_excel(uploaded_ref, dtype=str)
+                    _xl = pd.ExcelFile(uploaded_ref)
+                    _sheet = _xl.sheet_names[0]
+                    if len(_xl.sheet_names) > 1:
+                        st.warning(f"📑 This file has {len(_xl.sheet_names)} sheets — only ONE sheet is imported. "
+                                   "Make sure it is the right one:")
+                        _sheet = st.selectbox("Sheet to import", _xl.sheet_names, key="ref_import_sheet")
+                    imp_df = pd.read_excel(_xl, sheet_name=_sheet, dtype=str)
                     imp_df.columns = [str(c).strip() for c in imp_df.columns]
 
                     # Try to auto-map columns
@@ -2000,6 +2047,8 @@ def main():
                             if duty_col != "(skip)": col_map["Duty Rate"]              = duty_col
 
                     if "SKU" in col_map:
+                        st.caption("Columns used → " + " | ".join(f"{k}: «{v}»" for k, v in col_map.items())
+                                   + f"  (sheet «{_sheet}»)")
                         preview = pd.DataFrame()
                         preview["SKU"] = imp_df[col_map["SKU"]].apply(clean_text)
                         preview["Corrected DESCRIPTION"] = (
@@ -2014,7 +2063,20 @@ def main():
                             imp_df[col_map["Duty Rate"]].apply(format_duty_rate)
                             if "Duty Rate" in col_map else ""
                         )
+                        preview["Excel row"] = imp_df.index + 2        # row number in the Excel sheet
                         preview = preview[preview["SKU"] != ""]
+                        _dup = preview[preview["SKU"].str.upper().duplicated(keep=False)].copy()
+                        if len(_dup):
+                            _dup["_k"] = _dup["SKU"].str.upper()
+                            _conf = _dup.groupby("_k").filter(
+                                lambda g: g["Customs Commodity Code"].nunique() > 1 or g["Duty Rate"].nunique() > 1)
+                            st.warning(f"⚠️ {_dup['_k'].nunique()} SKU(s) appear more than once in this file "
+                                       f"({_conf['_k'].nunique()} with DIFFERENT HS / duty). "
+                                       "Only the LAST occurrence (lowest in the sheet) is imported.")
+                            if len(_conf):
+                                with st.expander("Show SKUs with conflicting HS / duty"):
+                                    st.dataframe(_conf.drop(columns=["_k"]).sort_values(["SKU", "Excel row"]),
+                                                 use_container_width=True, hide_index=True)
                         n_abn = int(preview["Customs Commodity Code"].apply(hs_len_abnormal).sum())
                         st.write(f"Preview — {len(preview)} valid rows detected:")
                         if n_abn:
@@ -2025,8 +2087,9 @@ def main():
                         if st.button("📥 Import & Merge into Reference Database"):
                             mapped_cols = [c for c in REF_COLUMNS[1:] if c in col_map]
                             existing = load_reference_db().copy()
-                            new = preview.drop_duplicates("SKU", keep="last").copy()
+                            new = preview.copy()
                             new["_k"] = new["SKU"].str.upper()
+                            new = new.drop_duplicates("_k", keep="last")
                             existing["_k"] = existing["SKU"].str.upper()
                             is_upd = existing["_k"].isin(set(new["_k"]))
                             new_by_key = new.set_index("_k")
