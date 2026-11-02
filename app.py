@@ -1293,6 +1293,7 @@ def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_l
     from openpyxl.utils import get_column_letter
 
     sheets = {}
+    yellow_rows = {}     # sheet name -> [bool per data row]: lines where a merged HS cell was split
     frames = [df for _, df, _, _ in empty_results if len(df)]
     if frames:
         sheets["空格检查"] = pd.concat(frames, ignore_index=True).rename(columns={
@@ -1320,6 +1321,7 @@ def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_l
             else:
                 res.append("HS 一致，仅描述等有差异")
         d["处理结果"] = res
+        yellow_rows["HS差异与处理"] = ["拆分合并格" in x for x in res]
         sheets["HS差异与处理"] = d[["File Name", "Sheet", "HS Row", "Line No", "SKU", "PL Description", "PL HS Code",
                                    "Ref HS Code", "Ref Duty Rate", "Severity", "Reason", "处理结果"]].rename(columns={
             "File Name": "文件", "HS Row": "Excel 行", "Line No": "行序", "PL Description": "箱单描述",
@@ -1328,6 +1330,7 @@ def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_l
     if change_log:
         sheets["改动明细"] = pd.DataFrame(change_log).rename(columns={
             "File": "文件", "Cell": "单元格", "Old HS": "原 HS", "New HS": "新 HS", "Action": "操作"})
+        yellow_rows["改动明细"] = ["拆分" in x["Action"] for x in change_log]
     skip_df = pd.DataFrame([x for x in skip_log if "already has" not in x["Reason"]])
     if len(skip_df):
         sheets["未改动的格"] = skip_df.rename(columns={"File": "文件", "Cell": "单元格", "Reason": "原因"})
@@ -1348,6 +1351,10 @@ def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_l
         for i, col in enumerate(df.columns, 1):
             width = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)]) + 2
             ws.column_dimensions[get_column_letter(i)].width = min(max(width, 8), 60)
+        for i, flag in enumerate(yellow_rows.get(name, []), start=2):
+            if flag:                                   # the whole row yellow: a merged HS cell was split for this line
+                for c in ws[i]:
+                    c.fill = PatternFill("solid", fgColor="FFFF00")
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
     out = io.BytesIO()
@@ -2149,6 +2156,7 @@ def main():
                 render_empty_cell_alert(empty_results)
                 _xl_bytes = build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_log)
                 if _xl_bytes:
+                    st.caption("Excel 里：整行黄色 = 该 SKU 所在的合并格被拆分过；普通按数据库修改的行不标色。")
                     st.download_button(
                         "⬇️ Download all errors as Excel / 下载错误明细 Excel（空格、HS 差异、改动、未改动原因）",
                         data=_xl_bytes,
