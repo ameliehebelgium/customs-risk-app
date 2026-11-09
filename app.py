@@ -1035,6 +1035,61 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# CACHED WRAPPERS — every click reruns the whole page; these keep the slow parts (reading 60+ workbooks,
+# comparing, patching, building PDFs) from being redone when their inputs did not change.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _df_key(df: pd.DataFrame) -> int:
+    try:
+        return int(pd.util.hash_pandas_object(df.astype(str), index=False).sum())
+    except Exception:
+        return hash(df.to_csv(index=False))
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def parse_upload_cached(name: str, data: bytes):
+    """Parse one uploaded workbook -> (parsed lines, note about multi-sheet workbooks)."""
+    f = _NamedBytes(data)
+    f.name = name
+    doc_df = normalize_document_file(f)
+    doc_df["_File"] = name
+    note = ""
+    try:
+        xls = pd.ExcelFile(io.BytesIO(data))
+        if len(xls.sheet_names) > 1:
+            note = f"📄 {name}: multi-sheet workbook — using sheet '{pick_packing_sheet(xls)}'"
+    except Exception:
+        pass
+    return doc_df, note
+
+
+@st.cache_data(show_spinner=False, max_entries=30)
+def check_cached(_doc_df, _ref_df, doc_key: int, ref_key: int):
+    return check_packing_list_against_reference(_doc_df, _ref_df)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def find_conflicts_cached(fname: str, file_bytes: bytes, _doc_rows, mini_lookup: dict):
+    lookup = {k: {"Customs Commodity Code": v[0], "Duty Rate": v[1]} for k, v in mini_lookup.items()}
+    return find_merged_hs_conflicts(file_bytes, fname, _doc_rows, lookup)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def apply_hs_cached(file_bytes: bytes, pl_sheet: str, edits: list, ctx: list):
+    return apply_hs_corrections_all_sheets(file_bytes, pl_sheet, edits, ctx)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def check_empty_cached(file_bytes: bytes, fname: str):
+    return check_empty_cells(file_bytes, fname)
+
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def build_pdf_cached(check_df: pd.DataFrame, files_info: str) -> bytes:
+    return build_pdf_report(check_df, files_info)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # MERGED-CELL (并格) HS CONFLICTS
 # Several SKU lines share ONE HS cell (merged / blank-below) but the reference
 # database gives them different HS codes. The user picks one HS for the whole
@@ -1143,7 +1198,7 @@ def render_check_summary(check_df: pd.DataFrame, doc_files, key: str, pdf_prefix
     col_h.warning(f"⚠️ HS 位数异常: {n('HSLEN')} line(s)")
     st.download_button(
         label="⬇️ Download PDF Report",
-        data=build_pdf_report(check_df, ", ".join([f.name for f in doc_files])),
+        data=build_pdf_cached(check_df, ", ".join([f.name for f in doc_files])),
         file_name=f"{pdf_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
         mime="application/pdf",
         key=f"dl_pdf_{key}",
@@ -1156,8 +1211,8 @@ def render_check_cards(check_df: pd.DataFrame):
         border, bg, icon = {"red":    ("#c0392b", "#fff5f5", "🔴"),
                             "yellow": ("#b7770d", "#fffdf0", "🟡"),
                             "purple": ("#6c3483", "#f9f0ff", "⚠️")}.get(color, ("#d35400", "#fff8f0", "🟠"))
-        for _, row in df.iterrows():
-            st.markdown(build_card_html(row, border, bg, icon), unsafe_allow_html=True)
+        st.markdown("".join(build_card_html(row, border, bg, icon) for _, row in df.iterrows()),
+                    unsafe_allow_html=True)
 
     for sev, color, title in (
             ("RED",    "red",    "#### 🔴 Action Required — Confirmed Mismatches"),
@@ -1499,6 +1554,115 @@ def render_empty_cell_alert(results: list):
         st.warning("📏 " + note)
     for e in errs:
         st.caption("ℹ️ " + e)
+
+
+def _empty_cell_notes(results: list) -> list:
+    """Table-structure remarks of the empty-cell check: [(file, remark)]."""
+    out = []
+    for fname, _df, counts, errs in results:
+        for e in errs:
+            out.append((fname, e))
+        if not counts and not errs:
+            out.append((fname, "未识别到产品表格（表头需含描述和 HS 列），此文件未做空格检查"))
+        if len(set(counts.values())) > 1:
+            out.append((fname, "各表产品行数不一致: " + "，".join(f"{sh} {n} 行" for sh, n in counts.items())))
+    return out
+
+
+def build_check_report_xlsx(check_df, empty_results, conflict_groups, merge_pick, check_eff, skipped) -> bytes:
+    """ONE Excel with every problem the checks found, one sheet per reason (+ a summary sheet).
+    skipped: [(file, cell, why)] — HS cells that could not be changed automatically."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    RISK_COLS = [("File Name", "文件 File"), ("Sheet", "工作表"), ("HS Row", "Excel 行"), ("Line No", "行号"),
+                 ("SKU", "SKU"), ("PL Description", "箱单描述"), ("PL HS Code", "箱单 HS"),
+                 ("Ref HS Code", "参照库 HS"), ("PL Duty Rate", "箱单税率"), ("Ref Duty Rate", "参照税率"),
+                 ("Ref Description", "参照库描述"), ("Reason", "原因 Reason"),
+                 ("Current Container", "柜号"), ("Job Number", "Job No"), ("Qty", "数量")]
+
+    def risk_frame(df):
+        cols = [(c, n) for c, n in RISK_COLS if c in df.columns]
+        out = df[[c for c, _ in cols]].copy()
+        out.columns = [n for _, n in cols]
+        return out
+
+    sheets = []      # (sheet name, explanation, DataFrame, header colour, highlight HS cells?)
+    if check_df is not None and len(check_df):
+        hs_diff = check_df["Cmp HS"] == "diff"
+        for sev, name, why, colour, hl in (
+                ("RED",    "红-HS与参照库不同", "SKU 已在参照库确认，但箱单 HS 与参照库不一致", "FFF4CCCC", True),
+                ("RED",    "红-仅描述不同",     "SKU 已在参照库确认，HS 一致但箱单描述与参照库不一致", "FFF4CCCC", False),
+                ("YELLOW", "黄-待海关确认",     "SKU 查验过但参照库信息还没经海关确认", "FFFFF2CC", True),
+                ("ORANGE", "橙-未处理SKU",      "SKU 在参照库里登记了，但还没有描述/HS，需要跟进", "FFFCE5CD", False),
+                ("HSLEN",  "HS位数异常",        "参照库里的 HS 不是 10 位，需先改参照库", "FFE4D7F0", False)):
+            sub = check_df[check_df["Severity"] == sev]
+            if sev == "RED":
+                sub = sub[hs_diff.loc[sub.index]] if hl else sub[~hs_diff.loc[sub.index]]
+            if len(sub):
+                sheets.append((name, why, risk_frame(sub), colour, hl))
+
+    empty_rows = [df for _, df, _, _ in empty_results if len(df)]
+    if empty_rows:
+        ed = pd.concat(empty_rows, ignore_index=True)
+        ed = ed[["File"] + [c for c in ed.columns if c != "File"]]
+        sheets.append(("空格", "单据里有空白的单元格，需补全后再清关", ed, "FFFFE699", False))
+
+    if conflict_groups:
+        rows = []
+        for g in conflict_groups:
+            ch = merge_pick.get(g["gid"])
+            decision = "未确认" if ch is None else ("不改，保持原样" if ch == MERGE_KEEP else f"统一写 {ch}")
+            for l in g["lines"]:
+                rows.append({"文件 File": g["file"], "工作表": g["sheet"], "HS 单元格": g["cell"],
+                             "箱单当前 HS": g["pl_hs"], "Excel 行": l["row"], "SKU": l["sku"], "箱单描述": l["desc"],
+                             "参照库 HS": l["ref_hs"], "参照税率": l["ref_duty"], "对比": l["state"], "你的处理": decision})
+        sheets.append(("并格冲突", "同一个 HS 单元格下的 SKU，参照库 HS 不一样；右侧是你选的处理", pd.DataFrame(rows), "FFD9EAD3", False))
+        if check_eff is not None and len(check_eff):
+            keys = {(g["file"], str(l["row"])) for g in conflict_groups for l in g["lines"]
+                    if merge_pick.get(g["gid"]) is not None}
+            aff = check_eff[[(f, str(r)) in keys for f, r in zip(check_eff["File Name"], check_eff["HS Row"])]]
+            if len(aff):
+                sheets.append(("并格选择后差异", "按你的并格选择统一 HS 之后，仍与参照库不同的行", risk_frame(aff), "FFD9EAD3", True))
+
+    if skipped:
+        sheets.append(("HS未能自动修改", "这些 HS 单元格没有被自动改成功，需要手动处理",
+                       pd.DataFrame(skipped, columns=["文件 File", "单元格", "原因"]), "FFF4CCCC", False))
+    notes = _empty_cell_notes(empty_results)
+    if notes:
+        sheets.append(("其它提示", "单据结构方面的提示", pd.DataFrame(notes, columns=["文件 File", "提示"]), "FFD9D9D9", False))
+
+    summary = pd.DataFrame([{"页签": n, "问题数（行）": len(df), "说明": why} for n, why, df, _, _ in sheets]
+                           or [{"页签": "（没有发现问题）", "问题数（行）": 0, "说明": ""}])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        summary.to_excel(xw, sheet_name="汇总", index=False)
+        for name, _why, df, _c, _h in sheets:
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+        colour_of = {n[:31]: (c, h) for n, _w, _d, c, h in sheets}
+        for ws in xw.book.worksheets:
+            colour, hl = colour_of.get(ws.title, ("FFD9D9D9", False))
+            for c in ws[1]:
+                c.font = Font(bold=True)
+                c.fill = PatternFill("solid", fgColor=colour)
+            ws.freeze_panes = "A2"
+            if ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+            for i, col in enumerate(ws.columns, 1):
+                width = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+                ws.column_dimensions[get_column_letter(i)].width = min(60, max(10, width + 2))
+            heads = {c.value: c.column for c in ws[1]}
+            for row in ws.iter_rows(min_row=2):
+                for c in row:
+                    c.alignment = Alignment(vertical="top", wrap_text=True)
+                if hl:      # same marking as the corrected files: yellow fill, red font on the HS that differs
+                    for h in ("箱单 HS", "参照库 HS"):
+                        if h in heads:
+                            cell = row[heads[h] - 1]
+                            cell.fill = PatternFill("solid", fgColor="FFFFFF00")
+                            if h == "箱单 HS":
+                                cell.font = Font(color="FFFF0000")
+    return buf.getvalue()
 
 
 class _NamedBytes(io.BytesIO):
@@ -2033,6 +2197,7 @@ def main():
             document_df, check_df, sku_lookup, ref_empty = None, None, {}, False
             fixed_rows = set()   # (file, packing-list Excel row) whose HS was changed
             merge_msgs = {}      # (file, packing-list row) -> note for lines inside a merged HS cell (Step 2)
+            conflict_groups, merge_pick, check_eff, dl_entries = [], {}, None, []    # filled below; read by the Excel report
             # a different set of files means the Step 2 choices no longer apply
             _files_sig = tuple((f.name, f.size) for f in doc_files)
             if st.session_state.get("_pl_files_sig") != _files_sig:
@@ -2047,14 +2212,9 @@ def main():
             upload_notes = []    # shown in a small scroll window right under the uploader
             for file in doc_files:
                 file_bytes[file.name] = file.getvalue()
-                doc_df = normalize_document_file(file)
-                doc_df["_File"] = file.name
-                try:
-                    _xls = pd.ExcelFile(file)
-                    if len(_xls.sheet_names) > 1:
-                        upload_notes.append(("caption", f"📄 {file.name}: multi-sheet workbook — using sheet '{pick_packing_sheet(_xls)}'"))
-                except Exception:
-                    pass
+                doc_df, _note = parse_upload_cached(file.name, file_bytes[file.name])
+                if _note:
+                    upload_notes.append(("caption", _note))
                 if len(doc_df) > 0:
                     all_doc_rows.append(doc_df)
                 else:
@@ -2079,7 +2239,8 @@ def main():
                     _show_parsed_preview(document_df)
                 else:
                     sku_lookup = build_sku_lookup(ref_df)
-                    check_df = check_packing_list_against_reference(document_df, ref_df)
+                    _doc_key, _ref_key = _df_key(document_df), _df_key(ref_df)
+                    check_df = check_cached(document_df, ref_df, _doc_key, _ref_key)
 
                     if len(check_df) == 0:
                         with result_slot:
@@ -2091,8 +2252,13 @@ def main():
                         _hs_diff_files = set(check_df.loc[check_df["Cmp HS"] == "diff", "File Name"])
                         for _fn in file_bytes:
                             if _fn in _hs_diff_files:
-                                conflict_groups += find_merged_hs_conflicts(
-                                    file_bytes[_fn], _fn, document_df[document_df["_File"] == _fn], sku_lookup)
+                                _rows = document_df[document_df["_File"] == _fn]
+                                _mini = {}
+                                for _sk in set(_rows["SKU Number"].astype(str).map(lambda x: clean_text(x).upper())):
+                                    _rf = sku_lookup.get(_sk) if _sk else None
+                                    if _rf:
+                                        _mini[_sk] = (_rf.get("Customs Commodity Code", ""), _rf.get("Duty Rate", ""))
+                                conflict_groups += find_conflicts_cached(_fn, file_bytes[_fn], _rows, _mini)
                         group_rows = {(g["file"], int(l["row"])) for g in conflict_groups for l in g["lines"]}
                         merge_pick, merge_ready = {}, True
                         if conflict_groups:
@@ -2133,7 +2299,7 @@ def main():
                                 doc_eff = document_df.copy()
                                 doc_eff["HS Code"] = [_override[(f, str(r))][0] if (f, str(r)) in _override else hs
                                                       for f, r, hs in zip(doc_eff["_File"], doc_eff["_HS_Row"], doc_eff["HS Code"])]
-                                check_eff = check_packing_list_against_reference(doc_eff, ref_df)
+                                check_eff = check_cached(doc_eff, ref_df, _df_key(doc_eff), _ref_key)
                                 with result_slot:
                                     st.markdown("#### 报告 2 · 并格选择后重新比对 / Re-checked report")
                                     st.caption("并格里的行：按你选的 HS 重新跟参照库比对（原因里会注明）；没有并格冲突的行与报告 1 相同。")
@@ -2227,9 +2393,9 @@ def main():
                                     if _row not in _chosen_rows and _h and not hs_len_abnormal(_h):
                                         _ctx.append((_row, _d["_HS_Col"], _h))
                                 try:
-                                    new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
+                                    new_bytes, applied, skipped = apply_hs_cached(
                                         file_bytes[fname], _pl_sheet,
-                                        [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()] + _gedits,
+                                        [(int(r["HS Row"]), str(r["HS Col"]), str(r["Ref HS Code"])) for _, r in chosen.iterrows()] + _gedits,
                                         _ctx,
                                     )
                                 except Exception as e:
@@ -2304,14 +2470,14 @@ def main():
             # ── Empty-cell check: runs LAST, on the files after the HS correction ──
             doc_idx = {}
             if document_df is not None:
-                for _, _r in document_df.iterrows():
+                for _r in document_df.to_dict("records"):
                     try:
                         doc_idx[(_r["_File"], int(_r["_HS_Row"]))] = _r
                     except Exception:
                         pass
             check_idx = {}
             if check_df is not None and len(check_df):
-                for _, _r in check_df.iterrows():
+                for _r in check_df.to_dict("records"):
                     try:
                         check_idx[(_r["File Name"], int(_r["HS Row"]))] = _r
                     except Exception:
@@ -2324,7 +2490,7 @@ def main():
 
             empty_results = []
             for _fname, _orig in file_bytes.items():
-                _iss, _cnt, _err, _lm = check_empty_cells(final_bytes.get(_fname, _orig), _fname)
+                _iss, _cnt, _err, _lm = check_empty_cached(final_bytes.get(_fname, _orig), _fname)
                 if len(_iss):
                     _iss = _iss.copy()
                     _iss["HS 核对结果"] = [
@@ -2335,6 +2501,19 @@ def main():
                 empty_results.append((_fname, _iss, _cnt, _err))
             with empty_slot:
                 render_empty_cell_alert(empty_results)
+            _skipped_all = [(_f, _c, _w) for _f, _a, _sk, _n, _b in dl_entries for _c, _w in _sk]
+            _any_problem = ((check_df is not None and len(check_df) > 0) or conflict_groups or _skipped_all
+                            or any(len(_d) for _, _d, _, _ in empty_results) or _empty_cell_notes(empty_results))
+            if _any_problem:        # one Excel with every problem found, one sheet per reason — next to the other reports
+                with result_slot:
+                    st.markdown("#### 📑 检查报告（全部问题，按原因分页）/ Full check report")
+                    st.download_button(
+                        label="⬇️ Download full check report (Excel)",
+                        data=build_check_report_xlsx(check_df, empty_results, conflict_groups, merge_pick, check_eff, _skipped_all),
+                        file_name=f"CheckReport_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_check_xlsx",
+                    )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
