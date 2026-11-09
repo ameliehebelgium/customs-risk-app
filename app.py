@@ -1125,6 +1125,7 @@ def merge_option_label(hs: str, n: int, duty: str, pl_hs: str) -> str:
 
 
 MERGE_KEEP_LABEL = "不改这个并格（保持原样 / 我自己手动拆分）"
+MERGE_CUSTOM_LABEL = "统一改成 → 我自己填写（在下面的框里输入 HS）"
 
 
 def _show_parsed_preview(document_df: pd.DataFrame):
@@ -1170,50 +1171,97 @@ def render_check_cards(check_df: pd.DataFrame):
 
 
 def render_merge_form(conflict_groups: list, merge_msgs: dict):
-    """Step 2 UI: one radio per merged HS cell, all inside one form (one rerun on submit).
-    Returns (choices {gid: HS or MERGE_KEEP}, ready). Choices are only returned once confirmed."""
-    _sig = hashlib.md5(json.dumps([[g["gid"], g["options"]] for g in conflict_groups],
-                                  ensure_ascii=False).encode("utf-8")).hexdigest()[:10]
+    """Step 2 UI. Every merged HS cell has its own radio (+ a free-text HS box) and its own confirm button;
+    a confirmed cell disappears from the list (it moves to the 'confirmed' list, where it can be undone).
+    A second button confirms every cell that already has a choice in one go.
+    Returns (choices {gid: HS or MERGE_KEEP}, ready) — ready only when every merged cell is confirmed."""
+    dec = st.session_state.setdefault("merge_decisions", {})        # group key -> chosen HS / MERGE_KEEP
+
+    def gkey(g):        # the options are part of the key: if the reference data changed, the old answer is void
+        return g["gid"] + "|" + hashlib.md5(json.dumps(g["options"]).encode("utf-8")).hexdigest()[:6]
+
+    def wkey(prefix, g):
+        return f"{prefix}_{hashlib.md5(gkey(g).encode('utf-8')).hexdigest()[:10]}"
+
+    pending = [g for g in conflict_groups if gkey(g) not in dec]
+    decided = [g for g in conflict_groups if gkey(g) in dec]
+
     st.markdown("### 🧩 并格 HS 选择 / Merged-cell HS")
-    st.warning(f"发现 **{len(conflict_groups)}** 个并格：同一个 HS 单元格下的 SKU，在参照数据库里的 HS **不一样**，自动改会互相打架。"
-               "请为每个并格选一个 HS（保留并格，不拆分，整格统一写成这一个），全部选完后点按钮。"
-               "  🔒 只改这次上传的单据文件，**不会修改参照数据库**。")
-    picks = {}
-    with st.form("merge_hs_form"):
-        with st.container(height=520):                  # scroll window: the button below stays in view
-            for _gi, g in enumerate(conflict_groups, 1):
-                with st.container(border=True):
-                    st.markdown(f"**{_gi}. 📄 {g['file']}** · 工作表 `{g['sheet']}` · HS 单元格 `{g['cell']}` · "
-                                f"箱单当前 HS **{g['pl_hs']}** · 共用此格的 {len(g['lines'])} 行")
-                    st.dataframe(pd.DataFrame({
-                        "Excel 行":       [l["row"] for l in g["lines"]],
-                        "SKU":            [l["sku"] for l in g["lines"]],
-                        "箱单描述":        [l["desc"] for l in g["lines"]],
-                        "箱单 HS (当前)":  [l["pl_hs"] for l in g["lines"]],
-                        "参照库 HS":       [l["ref_hs"] for l in g["lines"]],
-                        "参照税率":        [l["ref_duty"] for l in g["lines"]],
-                        "对比":            [l["state"] for l in g["lines"]],
-                    }), hide_index=True, use_container_width=True)
-                    _labels = {merge_option_label(hs, n, duty, g["pl_hs"]): hs for hs, n, duty in g["options"]}
-                    _pick = st.radio(
-                        "这个并格的 HS 怎么处理？", list(_labels) + [MERGE_KEEP_LABEL], index=None,
-                        key=f"mergepick_{_sig}_{hashlib.md5(g['gid'].encode('utf-8')).hexdigest()[:8]}")
-                    picks[g["gid"]] = (MERGE_KEEP if _pick == MERGE_KEEP_LABEL else _labels.get(_pick))
-        _submitted = st.form_submit_button(
-            "✅ 全部选完 → 重新出报告，并生成修改后的单据", type="primary", use_container_width=True)
-    if _submitted:
-        _missing = [i for i, g in enumerate(conflict_groups, 1) if picks[g["gid"]] is None]
-        if _missing:
-            st.session_state.pop("merge_confirm", None)
-            st.error(f"还有 {len(_missing)} 个并格没有选择（第 " + "、".join(map(str, _missing[:30]))
-                     + (" …" if len(_missing) > 30 else "") + " 个）。请全部选完再点按钮。")
-        else:
-            st.session_state["merge_confirm"] = {"sig": _sig, "choices": dict(picks)}
-    _conf = st.session_state.get("merge_confirm")
-    if _conf and _conf.get("sig") == _sig:
-        st.success("✅ 已确认所有并格的选择，结果和下载见下方。要改选择：改完再点一次按钮。")
-        return _conf["choices"], True
-    st.info("⬆️ 还没确认。选完所有并格、点上面的按钮之后，才会出现重新生成的报告和修改后的单据下载。")
+    for _msg in st.session_state.pop("_merge_flash", []):
+        st.error(_msg)
+    st.warning(f"共 **{len(conflict_groups)}** 个并格：同一个 HS 单元格下的 SKU，在参照数据库里的 HS **不一样**，自动改会互相打架。"
+               f"为每个并格选一个 HS（保留并格，不拆分，整格统一写成这一个）并点它下面的确认键，确认后这一项就会消失。"
+               f"**还剩 {len(pending)} 个待确认。**  🔒 只改这次上传的单据文件，**不会修改参照数据库**。")
+
+    if pending:
+        clicked, picks, customs = {}, {}, {}
+        _labels_of = {gkey(g): {merge_option_label(hs, n, duty, g["pl_hs"]): hs for hs, n, duty in g["options"]} for g in pending}
+        with st.form("merge_hs_form"):
+            with st.container(height=min(560, 480 * len(pending))):      # scroll window; the buttons stay in reach
+                for g in pending:
+                    gi = conflict_groups.index(g) + 1
+                    with st.container(border=True):
+                        st.markdown(f"**{gi}. 📄 {g['file']}** · 工作表 `{g['sheet']}` · HS 单元格 `{g['cell']}` · "
+                                    f"箱单当前 HS **{g['pl_hs']}** · 共用此格的 {len(g['lines'])} 行")
+                        st.dataframe(pd.DataFrame({
+                            "Excel 行":       [l["row"] for l in g["lines"]],
+                            "SKU":            [l["sku"] for l in g["lines"]],
+                            "箱单描述":        [l["desc"] for l in g["lines"]],
+                            "箱单 HS (当前)":  [l["pl_hs"] for l in g["lines"]],
+                            "参照库 HS":       [l["ref_hs"] for l in g["lines"]],
+                            "参照税率":        [l["ref_duty"] for l in g["lines"]],
+                            "对比":            [l["state"] for l in g["lines"]],
+                        }), hide_index=True, use_container_width=True)
+                        picks[gkey(g)] = st.radio(
+                            "这个并格的 HS 怎么处理？",
+                            list(_labels_of[gkey(g)]) + [MERGE_CUSTOM_LABEL, MERGE_KEEP_LABEL], index=None,
+                            key=wkey("mergepick", g))
+                        customs[gkey(g)] = st.text_input(
+                            "自定义 HS（只在选了「统一改成 → 我自己填写」时使用）", key=wkey("mergecustom", g),
+                            placeholder="例如 7308300000（10 位数字）")
+                        clicked[gkey(g)] = st.form_submit_button("✅ 确认这个并格", key=wkey("mergeok", g))
+            _all = st.form_submit_button("✅ 确认上面所有已经选好的并格", type="primary", use_container_width=True)
+
+        targets = [g for g in pending if clicked[gkey(g)]] or (pending if _all else [])
+        if targets:
+            flash, saved = [], 0
+            for g in targets:
+                gi, pick = conflict_groups.index(g) + 1, picks[gkey(g)]
+                if pick is None:
+                    if not _all:                       # 'confirm all' silently skips the ones without a choice
+                        flash.append(f"第 {gi} 个并格还没有选择。")
+                    continue
+                if pick == MERGE_KEEP_LABEL:
+                    dec[gkey(g)] = MERGE_KEEP
+                elif pick == MERGE_CUSTOM_LABEL:
+                    hs = clean_hs(customs[gkey(g)])
+                    if not (hs.isdigit() and len(hs) == HS_EXPECTED_LEN):
+                        flash.append(f"第 {gi} 个并格：自定义 HS「{customs[gkey(g)]}」不是 {HS_EXPECTED_LEN} 位数字，没有确认。")
+                        continue
+                    dec[gkey(g)] = hs
+                else:
+                    dec[gkey(g)] = _labels_of[gkey(g)][pick]
+                saved += 1
+            if _all and not saved and not flash:
+                flash.append("还没有选好任何一个并格。")
+            if flash:
+                st.session_state["_merge_flash"] = flash
+            st.rerun()
+
+    if decided:
+        with st.expander(f"✅ 已确认的并格（{len(decided)} 个）— 点开可以撤销重选", expanded=False):
+            for g in decided:
+                ch = dec[gkey(g)]
+                c1, c2 = st.columns([5, 1])
+                c1.markdown(f"**{conflict_groups.index(g) + 1}.** {g['file']} · `{g['cell']}` → "
+                            + ("**不改，保持原样**" if ch == MERGE_KEEP else f"统一写 **{ch}**"))
+                if c2.button("↩️ 撤销", key=wkey("mergeundo", g)):
+                    dec.pop(gkey(g), None)
+                    st.rerun()
+
+    if not pending:
+        st.success("✅ 所有并格都已确认，结果和下载见下方。")
+        return {g["gid"]: dec[gkey(g)] for g in conflict_groups}, True
     for g in conflict_groups:
         for l in g["lines"]:
             merge_msgs[(g["file"], int(l["row"]))] = "并格 HS 待你在 Step 2 选择，尚未修改"
@@ -1962,7 +2010,8 @@ def main():
             if st.button(f"🗑️ Remove all uploaded files ({len(doc_files)})", key="clear_all_docs"):
                 st.session_state["doc_uploader_ver"] += 1
                 for _k in list(st.session_state.keys()):      # forget per-file ticks / download widgets
-                    if str(_k).startswith(("fix_", "dl_fix_", "mergepick_", "dl_pdf_")) or _k in ("merge_confirm", "_pl_files_sig"):
+                    if str(_k).startswith(("fix_", "dl_fix_", "mergepick_", "mergecustom_", "mergeok_", "mergeundo_", "dl_pdf_")) \
+                            or _k in ("merge_confirm", "merge_decisions", "_merge_flash", "_pl_files_sig"):
                         del st.session_state[_k]
                 st.rerun()
 
@@ -1977,8 +2026,8 @@ def main():
         empty_slot      = st.container()   # empty-cell reminder
 
         if not doc_files:
-            st.session_state.pop("_pl_files_sig", None)
-            st.session_state.pop("merge_confirm", None)
+            for _k in ("_pl_files_sig", "merge_confirm", "merge_decisions", "_merge_flash"):
+                st.session_state.pop(_k, None)
 
         if doc_files:
             document_df, check_df, sku_lookup, ref_empty = None, None, {}, False
@@ -1988,7 +2037,8 @@ def main():
             _files_sig = tuple((f.name, f.size) for f in doc_files)
             if st.session_state.get("_pl_files_sig") != _files_sig:
                 for _k in list(st.session_state.keys()):
-                    if str(_k).startswith("mergepick_") or _k == "merge_confirm":
+                    if str(_k).startswith(("mergepick_", "mergecustom_", "mergeok_", "mergeundo_")) \
+                            or _k in ("merge_confirm", "merge_decisions", "_merge_flash"):
                         del st.session_state[_k]
                 st.session_state["_pl_files_sig"] = _files_sig
             all_doc_rows = []
