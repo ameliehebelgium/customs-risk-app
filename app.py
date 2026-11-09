@@ -990,9 +990,9 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
         if tbl is None:
             continue                                   # not an invoice/contract-style sheet
         rows_by_no = _line_rows(ws, tbl)
-        edits = []
+        edits, _seen = [], set()
         for row, _col, new_hs in pl_edits:
-            n = pl_ws[f"{pl_tbl['no_col']}{int(row)}"].value
+            n = _merged_top_value(pl_ws, f"{pl_tbl['no_col']}{int(row)}")
             try:
                 n = int(float(str(n).strip()))
             except Exception:
@@ -1011,11 +1011,14 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
             if isinstance(top, str) and top.startswith("="):
                 skipped.append((name, f"line No. {n}: HS is a formula — left unchanged"))
                 continue
+            if (r, new_hs) in _seen:                   # several SKU rows of one merged line -> one edit
+                continue
+            _seen.add((r, new_hs))
             edits.append((r, tbl["hs_col"], new_hs))
         ctx = []
         for row, _col, ref_hs in (pl_context or []):          # unchanged lines: only used to detect shared-cell conflicts
             try:
-                n = int(float(str(pl_ws[f"{pl_tbl['no_col']}{int(row)}"].value).strip()))
+                n = int(float(str(_merged_top_value(pl_ws, f"{pl_tbl['no_col']}{int(row)}")).strip()))
             except Exception:
                 continue
             r = rows_by_no.get(n)
@@ -1627,7 +1630,7 @@ def build_check_report_xlsx(check_df, empty_results, conflict_groups, merge_pick
 
     if skipped:
         sheets.append(("HS未能自动修改", "这些 HS 单元格没有被自动改成功，需要手动处理",
-                       pd.DataFrame(skipped, columns=["文件 File", "单元格", "原因"]), "FFF4CCCC", False))
+                       pd.DataFrame(skipped, columns=["文件 File", "位置（工作表 / 单元格）", "原因"]), "FFF4CCCC", False))
     notes = _empty_cell_notes(empty_results)
     if notes:
         sheets.append(("其它提示", "单据结构方面的提示", pd.DataFrame(notes, columns=["文件 File", "提示"]), "FFD9D9D9", False))
@@ -2458,7 +2461,7 @@ def main():
                                             if _app:
                                                 st.caption("Changed cells: " + ", ".join(f"{c} ({o} → {n})" for c, o, n, _ in _app))
                                             for _cell, _why in _skp:
-                                                st.warning(f"Cell {_cell} left unchanged — {_why}")
+                                                st.warning(f"{_cell}: 没有修改 — {_why}")
                                             if _dname:
                                                 st.download_button(
                                                     label=f"⬇️ Download corrected packing list — {_fn}",
