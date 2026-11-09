@@ -762,57 +762,75 @@ def check_packing_list_against_reference(doc_df: pd.DataFrame, ref_df: pd.DataFr
 # PDF EXPORT
 # ════════════════════════════════════════════════════════════════════════════════
 
+def _merged_start_map(ws) -> dict:
+    """{(row, col_idx): top-left coordinate of the merged block} for every cell inside a merged range."""
+    out = {}
+    for mr in ws.merged_cells.ranges:
+        start = mr.start_cell.coordinate
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                out[(r, c)] = start
+    return out
+
+
+def _hs_target_cell(ws, row, col, mmap=None) -> str:
+    """The cell that really holds the HS value shown on `row` of column `col`:
+    the top-left cell of a merged block, or the nearest filled cell above a blank one."""
+    from openpyxl.utils import column_index_from_string
+    r = int(row)
+    if mmap is None:
+        mmap = _merged_start_map(ws)
+    hit = mmap.get((r, column_index_from_string(col)))
+    if hit:
+        return hit
+    while r > 1 and ws[f"{col}{r}"].value in (None, ""):
+        r -= 1
+    return f"{col}{r}"
+
+
 def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, context: list = None):
-    """Write corrected HS codes into the ORIGINAL workbook and paint the changed cells yellow.
+    """Write corrected HS codes into the ORIGINAL workbook and paint those cells yellow.
 
-    edits:   list of (excel_row, column_letter, new_hs) — one per packing-list line to change.
-    context: same shape, for the OTHER lines of the sheet (new_hs = their reference HS, or ''
-             when unknown). They are never changed; they are only used to see which lines share
-             an HS cell (merged cells, or blank cells below a product row) with an edited line.
+    edits: list of (excel_row, column_letter, new_hs) — one per packing-list line.
+    context: same shape, for lines that are NOT being changed but whose reference HS is known.
+             If such a line shares the HS cell with an edited line and needs a different HS,
+             the cell is left untouched (reported as a conflict) — otherwise fixing one line
+             would break the other and every re-upload would flip the cell back and forth.
+    Sub-SKU lines share the HS cell of their product row (merged or blank cells below it);
+    the edit goes to that product-row cell. If SKUs under one product need different HS
+    codes the cell is left untouched and reported as a conflict.
 
-    Lines that share one HS cell and all need the same HS: that cell is changed.
-    Lines that share one HS cell but need DIFFERENT HS codes: the merged cell is split
-    (un-merged) and every line gets its own HS cell — the edited lines the reference HS (yellow),
-    the others keep the HS they had. This is the only way to give each SKU its own HS.
-
-    The workbook XML is patched in place (cell values + new styles + merge list), so formulas,
-    other sheets, widths and formatting are untouched.
+    The workbook XML is patched in place (one cell value + one new style), so formulas,
+    other sheets, widths, merges and formatting are untouched.
     Returns (new_bytes, applied, skipped); applied = [(cell, old, new, n_lines)],
     skipped = [(cell, reason)].
     """
     import io, re, zipfile
     import openpyxl
-    from openpyxl.utils import column_index_from_string
     from xml.sax.saxutils import escape as _esc
 
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     ws = wb[sheet_name]
 
-    # 1) resolve each line to the cell that really holds its HS value
+    # 1) resolve each edit to the cell that really holds the HS value
+    _mmap = _merged_start_map(ws)
+
     def _target_cell(row, col):
-        coord = f"{col}{int(row)}"
-        for mr in ws.merged_cells.ranges:
-            if coord in mr:
-                return mr.start_cell.coordinate
-        r = int(row)
-        while r > 1 and ws[f"{col}{r}"].value in (None, ""):
-            r -= 1
-        return f"{col}{r}"
+        return _hs_target_cell(ws, row, col, _mmap)
 
-    targets, ctx_targets = {}, {}          # coord -> [(row, col, hs)]
+    targets, ctx_targets = {}, {}
     for row, col, new_hs in edits:
-        targets.setdefault(_target_cell(row, col), []).append((int(row), col, clean_hs(new_hs)))
+        targets.setdefault(_target_cell(row, col), []).append(clean_hs(new_hs))
     for row, col, ref_hs in (context or []):
-        ctx_targets.setdefault(_target_cell(row, col), []).append((int(row), col, clean_hs(ref_hs)))
+        ctx_targets.setdefault(_target_cell(row, col), []).append(clean_hs(ref_hs))
 
-    applied, skipped, todo, splits = [], [], {}, []
-    for coord, items in targets.items():
+    applied, skipped, todo = [], [], {}
+    for coord, vals in targets.items():
         old = clean_hs(ws[coord].value)
-        vals = [v for _, _, v in items]
-        ctx_items = ctx_targets.get(coord, [])
-        allv = set(vals) | {v for _, _, v in ctx_items if v}
+        allv = set(vals) | set(ctx_targets.get(coord, []))
         if len(allv) > 1:
-            splits.append((coord, old, items, ctx_items))
+            skipped.append((coord, "SKUs sharing this HS cell need different HS codes: " + ", ".join(sorted(allv))
+                            + " — split the merged / shared HS cell by hand"))
         elif vals[0] == old:
             skipped.append((coord, "already has this HS"))
         elif not vals[0]:
@@ -821,35 +839,12 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, contex
             todo[coord] = vals[0]
             applied.append((coord, old, vals[0], len(vals)))
 
-    # 2) plan the splits: every line under a shared cell gets its own HS cell
-    writes = {}        # coord -> (text, yellow)
-    unmerge = []       # merged ranges to remove
-    for coord, old, items, ctx_items in splits:
-        col = re.sub(r"\d", "", coord)
-        top = int(re.sub(r"\D", "", coord))
-        new_by_row = {r: v for r, _, v in items}
-        rows = set(new_by_row) | {r for r, _, _ in ctx_items} | {top}
-        merged_here = False
-        for mr in ws.merged_cells.ranges:
-            if coord in mr:
-                unmerge.append(str(mr))
-                rows |= set(range(mr.min_row, mr.max_row + 1))
-                merged_here = True
-                break
-        for r in sorted(rows):
-            want = new_by_row.get(r) or old
-            changed = want != old
-            if r == top and not changed and not merged_here:
-                continue
-            writes[f"{col}{r}"] = (want, changed)
-            if changed:
-                applied.append((f"{col}{r}", old, want, "split"))
-
-    if not todo and not writes:
+    if not todo:
         return file_bytes, applied, skipped
 
-    # 3) patch the XML
+    # 2) patch the XML
     zin = zipfile.ZipFile(io.BytesIO(file_bytes))
+    names = zin.namelist()
     wbxml = zin.read("xl/workbook.xml").decode("utf-8")
     rels  = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
     m = None
@@ -893,65 +888,15 @@ def apply_hs_corrections(file_bytes: bytes, sheet_name: str, edits: list, contex
             style_map[s_idx] = len(xfs) + len(new_xfs) - 1
         return style_map[s_idx]
 
-    def _find_cell(coord):
-        return re.search(r'<c r="' + coord + r'"([^>]*?)(/>|>.*?</c>)', sheet_xml, re.S)
-
-    def _style_idx(coord, fallback=0):
-        cm = _find_cell(coord)
-        if cm:
-            sm_ = re.search(r'\bs="(\d+)"', cm.group(1))
-            if sm_:
-                return int(sm_.group(1))
-        return fallback
-
-    def put_cell(coord, text, yellow, fallback_s):
-        nonlocal sheet_xml
-        base = _style_idx(coord, fallback_s)
-        s_idx = yellow_style(base) if yellow else base
-        cell = f'<c r="{coord}" s="{s_idx}" t="inlineStr"><is><t>{_esc(text)}</t></is></c>'
-        cm = _find_cell(coord)
-        if cm:
-            sheet_xml = sheet_xml[:cm.start()] + cell + sheet_xml[cm.end():]
-            return
-        col = re.sub(r"\d", "", coord)
-        rown = int(re.sub(r"\D", "", coord))
-        rm = re.search(r'<row r="%d"([^>]*?)(/>|>(.*?)</row>)' % rown, sheet_xml, re.S)
-        if rm is None:
-            raise RuntimeError(f"row {rown} not found in sheet XML")
-        if rm.group(2) == "/>":
-            new_row = f'<row r="{rown}"{rm.group(1)}>{cell}</row>'
-        else:
-            inner = rm.group(3)
-            pos = len(inner)
-            for c2 in re.finditer(r'<c r="([A-Z]+)%d"' % rown, inner):
-                if column_index_from_string(c2.group(1)) > column_index_from_string(col):
-                    pos = c2.start()
-                    break
-            new_row = f'<row r="{rown}"{rm.group(1)}>{inner[:pos]}{cell}{inner[pos:]}</row>'
-        sheet_xml = sheet_xml[:rm.start()] + new_row + sheet_xml[rm.end():]
-
-    # splits: remove the merge first, remember the style of the old top-left cell
-    top_style = {}
-    for coord, *_ in splits:
-        top_style[re.sub(r"\d", "", coord)] = _style_idx(coord, 0)
-    for ref in unmerge:
-        sheet_xml, n_rm = re.subn(r'<mergeCell\s+ref="%s"\s*/>' % re.escape(ref), "", sheet_xml)
-        mc = re.search(r'<mergeCells count="(\d+)"', sheet_xml)
-        if mc and n_rm:
-            left = int(mc.group(1)) - n_rm
-            if left <= 0:
-                sheet_xml = re.sub(r'<mergeCells[^>]*>\s*</mergeCells>', "", sheet_xml)
-            else:
-                sheet_xml = sheet_xml.replace(mc.group(0), f'<mergeCells count="{left}"', 1)
-    for coord, (text, yellow) in writes.items():
-        col = re.sub(r"\d", "", coord)
-        put_cell(coord, text, yellow, top_style.get(col, 0))
-
-    # plain case: one shared cell, one HS for everybody
     for coord, new_hs in todo.items():
-        if _find_cell(coord) is None:
+        cm = re.search(r'<c r="' + coord + r'"([^>]*?)(/>|>.*?</c>)', sheet_xml, re.S)
+        if cm is None:
             raise RuntimeError(f"cell {coord} not found in sheet XML")
-        put_cell(coord, new_hs, True, 0)
+        attrs = cm.group(1)
+        sm_ = re.search(r'\bs="(\d+)"', attrs)
+        s_new = yellow_style(int(sm_.group(1)) if sm_ else 0)
+        cell = f'<c r="{coord}" s="{s_new}" t="inlineStr"><is><t>{_esc(new_hs)}</t></is></c>'
+        sheet_xml = sheet_xml[:cm.start()] + cell + sheet_xml[cm.end():]
 
     styles_xml = styles_xml.replace(
         xm.group(0),
@@ -1087,6 +1032,151 @@ def apply_hs_corrections_all_sheets(file_bytes: bytes, pl_sheet: str, pl_edits: 
         applied += [(f"{name}!{c}", o, n, k) for c, o, n, k in a]
         skipped += [(f"{name}!{c}", why) for c, why in sk]
     return new_bytes, applied, skipped
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MERGED-CELL (并格) HS CONFLICTS
+# Several SKU lines share ONE HS cell (merged / blank-below) but the reference
+# database gives them different HS codes. The user picks one HS for the whole
+# merged cell (or leaves it alone). Nothing here ever touches the reference database:
+# it only decides what is written into the uploaded file of this run.
+# ════════════════════════════════════════════════════════════════════════════════
+
+MERGE_KEEP = "__keep__"   # choice value: leave this merged cell exactly as it is
+
+
+def find_merged_hs_conflicts(file_bytes: bytes, fname: str, doc_rows: pd.DataFrame, sku_lookup: dict) -> list:
+    """Merged HS cells of one file whose SKUs have DIFFERENT valid reference HS codes.
+
+    doc_rows: parsed lines of this file (document_df rows with _HS_Row / _HS_Col / _Sheet).
+    Returns a list of dicts:
+      gid, file, sheet, cell, pl_hs, lines=[{row, line, sku, desc, pl_hs, ref_hs, ref_duty, state}],
+      options=[(hs, n_skus, duty_text)]   (distinct valid reference HS codes, most frequent first)
+    """
+    import openpyxl
+    rows = doc_rows[doc_rows["_HS_Row"].astype(str) != ""]
+    if rows.empty:
+        return []
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    except Exception:
+        return []
+    groups = {}
+    for sheet, g_sheet in rows.groupby("_Sheet", sort=False):
+        if sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+        mmap = _merged_start_map(ws)
+        for _, r in g_sheet.iterrows():
+            try:
+                row = int(r["_HS_Row"])
+                cell = _hs_target_cell(ws, row, r["_HS_Col"], mmap)
+            except Exception:
+                continue
+            groups.setdefault((sheet, cell), []).append((row, r))
+
+    out = []
+    for (sheet, cell), members in groups.items():
+        if len(members) < 2:
+            continue
+        lines, ref_count, ref_duty = [], {}, {}
+        for row, r in members:
+            sku = clean_text(r.get("SKU Number", ""))
+            pl_hs = clean_hs(r.get("HS Code", ""))
+            ref = sku_lookup.get(sku.upper()) if sku else None
+            ref_hs = clean_hs(ref.get("Customs Commodity Code", "")) if ref else ""
+            duty = clean_text(ref.get("Duty Rate", "")) if ref else ""
+            if not sku:
+                state = "无 SKU"
+            elif ref is None:
+                state = "参照库无此 SKU"
+            elif not ref_hs:
+                state = "参照库无 HS"
+            elif hs_len_abnormal(ref_hs):
+                state = "⚠️ 参照 HS 位数异常"
+            elif ref_hs == pl_hs:
+                state = "✅ 与箱单一致"
+            else:
+                state = "❌ 与箱单不同"
+            if ref_hs and not hs_len_abnormal(ref_hs):
+                ref_count[ref_hs] = ref_count.get(ref_hs, 0) + 1
+                if duty:
+                    ref_duty.setdefault(ref_hs, set()).add(duty)
+            lines.append({"row": row, "col": r.get("_HS_Col", ""), "line": r.get("Line No", ""), "sku": sku,
+                          "desc": clean_text(r.get("Product Description", "")),
+                          "pl_hs": pl_hs, "ref_hs": ref_hs, "ref_duty": duty, "state": state})
+        if len(ref_count) < 2:
+            continue          # all known SKUs agree on one HS -> the normal automatic correction handles it
+        options = [(hs, n, " / ".join(sorted(ref_duty.get(hs, []))))
+                   for hs, n in sorted(ref_count.items(), key=lambda kv: (-kv[1], kv[0]))]
+        out.append({"gid": f"{fname}|{sheet}|{cell}", "file": fname, "sheet": sheet, "cell": cell,
+                    "pl_hs": lines[0]["pl_hs"], "lines": lines, "options": options})
+    return out
+
+
+def merge_option_label(hs: str, n: int, duty: str, pl_hs: str) -> str:
+    txt = f"统一写 {hs}　（参照库里 {n} 个 SKU 是这个 HS"
+    if duty:
+        txt += f"，税率 {duty}"
+    txt += "）"
+    if hs == pl_hs:
+        txt += " · 即箱单当前 HS"
+    return txt
+
+
+MERGE_KEEP_LABEL = "不改这个并格（保持原样 / 我自己手动拆分）"
+
+
+def render_check_report(check_df: pd.DataFrame, doc_files, key: str, pdf_prefix: str = "RiskReport"):
+    """Counts + comparison cards + PDF download for one check result (used for the first and the re-checked report)."""
+    red_df    = check_df[check_df["Severity"] == "RED"]
+    yellow_df = check_df[check_df["Severity"] == "YELLOW"]
+    orange_df = check_df[check_df["Severity"] == "ORANGE"]
+    hslen_df  = check_df[check_df["Severity"] == "HSLEN"]
+
+    col_r, col_y, col_o, col_h = st.columns(4)
+    col_r.error(f"🔴 RED: {len(red_df)} line(s)")
+    col_y.warning(f"🟡 YELLOW: {len(yellow_df)} line(s)")
+    col_o.info(f"🟠 ORANGE: {len(orange_df)} line(s)")
+    col_h.warning(f"⚠️ HS 位数异常: {len(hslen_df)} line(s)")
+
+    def render_cards(df, color):
+        if color == "red":
+            border, bg, icon = "#c0392b", "#fff5f5", "🔴"
+        elif color == "yellow":
+            border, bg, icon = "#b7770d", "#fffdf0", "🟡"
+        elif color == "purple":
+            border, bg, icon = "#6c3483", "#f9f0ff", "⚠️"
+        else:
+            border, bg, icon = "#d35400", "#fff8f0", "🟠"
+        for _, row in df.iterrows():
+            st.markdown(build_card_html(row, border, bg, icon), unsafe_allow_html=True)
+
+    if len(red_df) > 0:
+        st.markdown("#### 🔴 Action Required — Confirmed Mismatches")
+        render_cards(red_df, "red")
+    if len(yellow_df) > 0:
+        st.markdown("#### 🟡 Pending Review — Awaiting Customs Confirmation")
+        render_cards(yellow_df, "yellow")
+    if len(orange_df) > 0:
+        st.markdown("#### 🟠 Log & Monitor — Unprocessed SKUs")
+        render_cards(orange_df, "orange")
+    if len(hslen_df) > 0:
+        st.markdown("#### ⚠️ HS 位数异常 — Reference HS is not a 10-digit code")
+        render_cards(hslen_df, "purple")
+
+    st.markdown("---")
+    st.markdown("#### 📄 Export Risk Report")
+    files_info = ", ".join([f.name for f in doc_files])
+    st.download_button(
+        label="⬇️ Download PDF Report",
+        data=build_pdf_report(check_df, files_info),
+        file_name=f"{pdf_prefix}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        mime="application/pdf",
+        type="primary",
+        use_container_width=False,
+        key=f"dl_pdf_{key}",
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1251,8 +1341,10 @@ def check_empty_cells(file_bytes: bytes, filename: str):
     return pd.DataFrame(issues), counts, errors, linemaps
 
 
-def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx, lookup, check_idx, fixed, ref_empty):
-    """Why the HS of a line was (not) changed — shown next to its empty cells."""
+def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx, lookup, check_idx, fixed, ref_empty,
+                            merge_msgs=None):
+    """Why the HS of a line was (not) changed — shown next to its empty cells.
+    merge_msgs: {(file, packing-list row): text} for lines inside a merged HS cell with conflicting reference HS."""
     if ref_empty:
         return "参照数据库为空，未核对 HS"
     if not pl_sheet:
@@ -1264,6 +1356,8 @@ def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx
         pl_row = inv.get(line) if line != "" else None
     if pl_row is None:
         return "箱单里找不到对应行号，未核对 HS"
+    if merge_msgs and (fname, pl_row) in merge_msgs:
+        return merge_msgs[(fname, pl_row)]
     d = doc_idx.get((fname, pl_row))
     if d is None:
         return "该行未被解析（描述或 HS 为空），未核对 HS"
@@ -1284,82 +1378,6 @@ def hs_status_for_empty_row(fname, sheet, row, line, pl_sheet, linemaps, doc_idx
     if c["Cmp HS"] == "na":
         return "参照库有此 SKU，但无 HS 信息，HS 未改"
     return "HS 与参照数据库一致，无需修改（仅描述有差异）"
-
-
-def build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_log) -> bytes:
-    """One Excel file with everything the app flagged, for side-by-side comparison."""
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-
-    sheets = {}
-    yellow_rows = {}     # sheet name -> [bool per data row]: lines where a merged HS cell was split
-    frames = [df for _, df, _, _ in empty_results if len(df)]
-    if frames:
-        sheets["空格检查"] = pd.concat(frames, ignore_index=True).rename(columns={
-            "File": "文件", "Sheet": "Sheet", "Excel row": "Excel 行", "Line No": "行号 No.",
-            "Description": "产品描述", "Empty": "空的字段", "Cells": "空的单元格"})
-    cnt_rows = []
-    for fname, _df, counts, _e in empty_results:
-        if len(set(counts.values())) > 1:
-            cnt_rows += [{"文件": fname, "Sheet": sh, "产品行数": n} for sh, n in counts.items()]
-    if cnt_rows:
-        sheets["各表行数不一致"] = pd.DataFrame(cnt_rows)
-    if check_df is not None and len(check_df):
-        d = check_df.copy()
-        split_cells = {(x["File"], x["Cell"]) for x in change_log if "拆分" in x["Action"]}
-        res = []
-        for _, r in d.iterrows():
-            key = (r["File Name"], int(r["HS Row"])) if str(r["HS Row"]) != "" else None
-            cell = f"{r['Sheet']}!{r['HS Col']}{r['HS Row']}"
-            if key in fixed_rows:
-                res.append("已修改（拆分合并格）" if (r["File Name"], cell) in split_cells else "已修改为参照 HS")
-            elif r["Severity"] == "HSLEN":
-                res.append("未修改：参照库 HS 位数异常")
-            elif r["Cmp HS"] == "diff":
-                res.append("未修改（未勾选，或无法自动改）")
-            else:
-                res.append("HS 一致，仅描述等有差异")
-        d["处理结果"] = res
-        yellow_rows["HS差异与处理"] = ["拆分合并格" in x for x in res]
-        sheets["HS差异与处理"] = d[["File Name", "Sheet", "HS Row", "Line No", "SKU", "PL Description", "PL HS Code",
-                                   "Ref HS Code", "Ref Duty Rate", "Severity", "Reason", "处理结果"]].rename(columns={
-            "File Name": "文件", "HS Row": "Excel 行", "Line No": "行序", "PL Description": "箱单描述",
-            "PL HS Code": "箱单 HS", "Ref HS Code": "参照库 HS", "Ref Duty Rate": "参照税率",
-            "Severity": "级别", "Reason": "原因"})
-    if change_log:
-        sheets["改动明细"] = pd.DataFrame(change_log).rename(columns={
-            "File": "文件", "Cell": "单元格", "Old HS": "原 HS", "New HS": "新 HS", "Action": "操作"})
-        yellow_rows["改动明细"] = ["拆分" in x["Action"] for x in change_log]
-    skip_df = pd.DataFrame([x for x in skip_log if "already has" not in x["Reason"]])
-    if len(skip_df):
-        sheets["未改动的格"] = skip_df.rename(columns={"File": "文件", "Cell": "单元格", "Reason": "原因"})
-    if not sheets:
-        return b""
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-    for name, df in sheets.items():
-        ws = wb.create_sheet(name)
-        ws.append(list(df.columns))
-        for row in df.astype(object).where(df.notna(), "").values.tolist():
-            ws.append(row)
-        for c in ws[1]:
-            c.font = Font(bold=True)
-            c.fill = PatternFill("solid", fgColor="DDDDDD")
-            c.alignment = Alignment(vertical="center")
-        for i, col in enumerate(df.columns, 1):
-            width = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)]) + 2
-            ws.column_dimensions[get_column_letter(i)].width = min(max(width, 8), 60)
-        for i, flag in enumerate(yellow_rows.get(name, []), start=2):
-            if flag:                                   # the whole row yellow: a merged HS cell was split for this line
-                for c in ws[i]:
-                    c.fill = PatternFill("solid", fgColor="FFFF00")
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
 
 
 def render_empty_cell_alert(results: list):
@@ -1903,7 +1921,7 @@ def main():
             if st.button(f"🗑️ Remove all uploaded files ({len(doc_files)})", key="clear_all_docs"):
                 st.session_state["doc_uploader_ver"] += 1
                 for _k in list(st.session_state.keys()):      # forget per-file ticks / download widgets
-                    if str(_k).startswith(("fix_", "dl_fix_")):
+                    if str(_k).startswith(("fix_", "dl_fix_", "mergepick_", "dl_pdf_")) or _k in ("merge_confirm", "_pl_files_sig"):
                         del st.session_state[_k]
                 st.rerun()
 
@@ -1914,10 +1932,21 @@ def main():
         # here later, once the corrected files exist, so it shows at the top of the results.
         zip_slot = st.container()
 
+        if not doc_files:
+            st.session_state.pop("_pl_files_sig", None)
+            st.session_state.pop("merge_confirm", None)
+
         if doc_files:
             document_df, check_df, sku_lookup, ref_empty = None, None, {}, False
             fixed_rows = set()   # (file, packing-list Excel row) whose HS was changed
-            change_log, skip_log = [], []   # for the downloadable error table
+            merge_msgs = {}      # (file, packing-list row) -> note for lines inside a merged HS cell (Step 2)
+            # a different set of files means the Step 2 choices no longer apply
+            _files_sig = tuple((f.name, f.size) for f in doc_files)
+            if st.session_state.get("_pl_files_sig") != _files_sig:
+                for _k in list(st.session_state.keys()):
+                    if str(_k).startswith("mergepick_") or _k == "merge_confirm":
+                        del st.session_state[_k]
+                st.session_state["_pl_files_sig"] = _files_sig
             all_doc_rows = []
             file_bytes = {}
             final_bytes = {}     # what the user will actually download: corrected file if HS was changed, else the original
@@ -1952,173 +1981,250 @@ def main():
                     if len(check_df) == 0:
                         st.success("✅ No issues detected — all SKUs match the reference data.")
                     else:
-                        red_df    = check_df[check_df["Severity"] == "RED"]
-                        yellow_df = check_df[check_df["Severity"] == "YELLOW"]
-                        orange_df = check_df[check_df["Severity"] == "ORANGE"]
-                        hslen_df  = check_df[check_df["Severity"] == "HSLEN"]
+                        # ════ STEP 1 · the risk report (unchanged) ════
+                        st.markdown("### Step 1 · 风险报告 / Risk report")
+                        render_check_report(check_df, doc_files, key="step1")
 
-                        col_r, col_y, col_o, col_h = st.columns(4)
-                        col_r.error(f"🔴 RED: {len(red_df)} line(s)")
-                        col_y.warning(f"🟡 YELLOW: {len(yellow_df)} line(s)")
-                        col_o.info(f"🟠 ORANGE: {len(orange_df)} line(s)")
-                        col_h.warning(f"⚠️ HS 位数异常: {len(hslen_df)} line(s)")
+                        # ════ STEP 2 · merged-cell (并格) HS conflicts ════
+                        # Merged / shared HS cells whose SKUs have DIFFERENT reference HS codes.
+                        conflict_groups = []
+                        _hs_diff_files = set(check_df.loc[check_df["Cmp HS"] == "diff", "File Name"])
+                        for _fn in file_bytes:
+                            if _fn in _hs_diff_files:
+                                conflict_groups += find_merged_hs_conflicts(
+                                    file_bytes[_fn], _fn, document_df[document_df["_File"] == _fn], sku_lookup)
+                        group_rows = {(g["file"], int(l["row"])) for g in conflict_groups for l in g["lines"]}
+                        merge_pick = {}          # gid -> chosen HS, or MERGE_KEEP (only filled once the user confirmed)
+                        merge_ready = True       # False while the user still has to choose
 
-                        # ── Card renderer ──
-                        def render_cards(df, color):
-                            if color == "red":
-                                border, bg, icon = "#c0392b", "#fff5f5", "🔴"
-                            elif color == "yellow":
-                                border, bg, icon = "#b7770d", "#fffdf0", "🟡"
-                            elif color == "purple":
-                                border, bg, icon = "#6c3483", "#f9f0ff", "⚠️"
+                        st.markdown("---")
+                        st.markdown("### Step 2 · 并格 HS 选择 / Merged-cell HS")
+                        if not conflict_groups:
+                            st.caption("没有发现「并格里的 SKU 参照 HS 不一致」的情况，直接进入下一步。")
+                        else:
+                            _sig = hashlib.md5(json.dumps([[g["gid"], g["options"]] for g in conflict_groups],
+                                                          ensure_ascii=False).encode("utf-8")).hexdigest()[:10]
+                            st.warning(f"发现 **{len(conflict_groups)}** 个并格：同一个 HS 单元格下的 SKU，在参照数据库里的 HS **不一样**，"
+                                       "自动改会互相打架。请为每个并格选一个 HS（保留并格，不拆分，整格统一写成这一个），"
+                                       "全部选完后点最下面的按钮。")
+                            st.caption("🔒 只改这次上传的单据文件，**不会修改参照数据库**。选完之前不会生成任何修改后的文件。")
+                            picks = {}
+                            with st.form("merge_hs_form"):
+                                for _gi, g in enumerate(conflict_groups, 1):
+                                    with st.container(border=True):
+                                        st.markdown(f"**{_gi}. 📄 {g['file']}** · 工作表 `{g['sheet']}` · HS 单元格 `{g['cell']}` · "
+                                                    f"箱单当前 HS **{g['pl_hs']}** · 共用此格的 {len(g['lines'])} 行")
+                                        st.dataframe(pd.DataFrame({
+                                            "Excel 行":       [l["row"] for l in g["lines"]],
+                                            "SKU":            [l["sku"] for l in g["lines"]],
+                                            "箱单描述":        [l["desc"] for l in g["lines"]],
+                                            "箱单 HS (当前)":  [l["pl_hs"] for l in g["lines"]],
+                                            "参照库 HS":       [l["ref_hs"] for l in g["lines"]],
+                                            "参照税率":        [l["ref_duty"] for l in g["lines"]],
+                                            "对比":            [l["state"] for l in g["lines"]],
+                                        }), hide_index=True, use_container_width=True)
+                                        _labels = {merge_option_label(hs, n, duty, g["pl_hs"]): hs for hs, n, duty in g["options"]}
+                                        _pick = st.radio(
+                                            "这个并格的 HS 怎么处理？", list(_labels) + [MERGE_KEEP_LABEL], index=None,
+                                            key=f"mergepick_{_sig}_{hashlib.md5(g['gid'].encode('utf-8')).hexdigest()[:8]}")
+                                        picks[g["gid"]] = (MERGE_KEEP if _pick == MERGE_KEEP_LABEL else _labels.get(_pick))
+                                _submitted = st.form_submit_button(
+                                    "✅ 全部选完 → 重新出报告，并生成修改后的单据", type="primary", use_container_width=True)
+                            if _submitted:
+                                _missing = [i for i, g in enumerate(conflict_groups, 1) if picks[g["gid"]] is None]
+                                if _missing:
+                                    st.session_state.pop("merge_confirm", None)
+                                    st.error(f"还有 {len(_missing)} 个并格没有选择（第 " + "、".join(map(str, _missing[:30]))
+                                             + (" …" if len(_missing) > 30 else "") + " 个）。请全部选完再点按钮。")
+                                else:
+                                    st.session_state["merge_confirm"] = {"sig": _sig, "choices": dict(picks)}
+                            _conf = st.session_state.get("merge_confirm")
+                            if _conf and _conf.get("sig") == _sig:
+                                merge_pick = _conf["choices"]
+                                st.success("✅ 已确认所有并格的选择。下面是重新出的报告和修改后的单据。要改选择：改完再点一次按钮。")
                             else:
-                                border, bg, icon = "#d35400", "#fff8f0", "🟠"
+                                merge_ready = False
+                                st.info("⬆️ 还没确认。选完所有并格、点上面的按钮之后，才会出现重新生成的报告和修改后的单据下载。")
+                                for g in conflict_groups:
+                                    for l in g["lines"]:
+                                        merge_msgs[(g["file"], int(l["row"]))] = "并格 HS 待你在 Step 2 选择，尚未修改"
 
-                            for _, row in df.iterrows():
-                                st.markdown(build_card_html(row, border, bg, icon), unsafe_allow_html=True)
+                        if merge_ready:
+                            # what the user decided, per file
+                            group_edits, group_choice = {}, {}     # file -> [(row, col, hs)] ; (file, row) -> (hs, original hs)
+                            _override, _kept = {}, set()
+                            for g in conflict_groups:
+                                _ch = merge_pick.get(g["gid"])
+                                for l in g["lines"]:
+                                    _k = (g["file"], str(l["row"]))
+                                    if _ch == MERGE_KEEP:
+                                        _kept.add(_k)
+                                        merge_msgs[(g["file"], int(l["row"]))] = "并格：你选择了不改，HS 保持原样"
+                                    elif _ch:
+                                        _override[_k] = (_ch, l["pl_hs"])
+                                        group_edits.setdefault(g["file"], []).append((int(l["row"]), l["col"], _ch))
+                                        group_choice[(g["file"], int(l["row"]))] = (_ch, l["pl_hs"])
 
-                        if len(red_df) > 0:
-                            st.markdown("#### 🔴 Action Required — Confirmed Mismatches")
-                            render_cards(red_df, "red")
-                        if len(yellow_df) > 0:
-                            st.markdown("#### 🟡 Pending Review — Awaiting Customs Confirmation")
-                            render_cards(yellow_df, "yellow")
-                        if len(orange_df) > 0:
-                            st.markdown("#### 🟠 Log & Monitor — Unprocessed SKUs")
-                            render_cards(orange_df, "orange")
-                        if len(hslen_df) > 0:
-                            st.markdown("#### ⚠️ HS 位数异常 — Reference HS is not a 10-digit code")
-                            render_cards(hslen_df, "purple")
+                            # ════ STEP 3 · re-checked report (only when there were merged-cell decisions) ════
+                            if conflict_groups:
+                                st.markdown("---")
+                                st.markdown("### Step 3 · 重新出的报告 / Re-checked report")
+                                st.caption("并格里的行：按你选的 HS 重新跟参照数据库比对（「PL HS Code」显示的是统一后写进单据的 HS，原因里会注明）；"
+                                           "没有并格冲突的行与 Step 1 的报告相同。")
+                                doc_eff = document_df.copy()
+                                doc_eff["HS Code"] = [_override[(f, str(r))][0] if (f, str(r)) in _override else hs
+                                                      for f, r, hs in zip(doc_eff["_File"], doc_eff["_HS_Row"], doc_eff["HS Code"])]
+                                check_eff = check_packing_list_against_reference(doc_eff, ref_df)
+                                if len(check_eff):
+                                    _notes = []
+                                    for _, _r in check_eff.iterrows():
+                                        _k = (_r["File Name"], str(_r["HS Row"]))
+                                        _rs = _r["Reason"]
+                                        if _k in _override:
+                                            _rs += f" | 并格统一：箱单原 HS {_override[_k][1]} → 统一写 {_override[_k][0]}（人工选择）"
+                                        elif _k in _kept:
+                                            _rs += " | 并格：你选择不改，箱单 HS 保持原样"
+                                        _notes.append(_rs)
+                                    check_eff["Reason"] = _notes
+                                    render_check_report(check_eff, doc_files, key="step3", pdf_prefix="RiskReport_after_merge")
+                                else:
+                                    st.success("✅ 按你的选择处理后，所有 SKU 都与参照数据库一致。")
 
-                        # PDF export
-                        st.markdown("---")
-                        st.markdown("#### 📄 Export Risk Report")
-                        files_info = ", ".join([f.name for f in doc_files])
-                        pdf_bytes  = build_pdf_report(check_df, files_info)
-                        report_name = f"RiskReport_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-                        st.download_button(
-                            label="⬇️ Download PDF Report",
-                            data=pdf_bytes,
-                            file_name=report_name,
-                            mime="application/pdf",
-                            type="primary",
-                            use_container_width=False,
-                        )
-
-                        # ── Corrected packing list: HS taken from the reference, changed cells yellow ──
-                        st.markdown("---")
-                        st.markdown("#### ✏️ Corrected Packing List")
-                        st.caption("Replaces the HS in the packing list with the reference HS and marks each changed cell "
-                                   "yellow. Everything else in the file stays as it was. Untick lines you do not want to change.")
-                        fix_df = check_df[(check_df["Cmp HS"] == "diff") & (check_df["Severity"] != "HSLEN")]
-                        fix_df = fix_df[fix_df["HS Row"].astype(str) != ""]
-                        if len(fix_df) == 0:
-                            st.info("No HS differences that can be corrected automatically.")
-                        corrected_files = []   # (download name, bytes) of every file actually changed
-                        for fname in fix_df["File Name"].unique() if len(fix_df) else []:
-                            sub = fix_df[fix_df["File Name"] == fname].reset_index(drop=True)
-                            st.markdown(f"**{fname}** — {len(sub)} line(s) with a different HS")
-                            table = pd.DataFrame({
-                                "Apply":                  True,
-                                "Line":                   sub["Line No"].values,
-                                "SKU":                    sub["SKU"].values,
-                                "Description":            sub["PL Description"].values,
-                                "HS in packing list":     sub["PL HS Code"].values,
-                                "HS in reference (new)":  sub["Ref HS Code"].values,
-                                "Duty (ref)":             sub["Ref Duty Rate"].values,
-                            })
-                            edited_fix = st.data_editor(
-                                table, hide_index=True, use_container_width=True, key=f"fix_{fname}",
-                                disabled=[c for c in table.columns if c != "Apply"],
-                            )
-                            chosen = sub[edited_fix["Apply"].values]
-                            if len(chosen) == 0:
-                                st.caption("No line selected.")
-                                continue
-                            # lines of this file that are left as they are but have a known reference HS:
-                            # they must not be broken by a change to a HS cell they share with a corrected line
-                            _chosen_rows = {int(r["HS Row"]) for _, r in chosen.iterrows()}
-                            _ctx = []
-                            for _, _d in document_df[document_df["_File"] == fname].iterrows():
+                            # ════ STEP 3/4 · corrected packing lists ════
+                            st.markdown("---")
+                            st.markdown(f"### Step {4 if conflict_groups else 3} · 修改单据并下载 / Corrected packing lists")
+                            st.caption("Replaces the HS in the packing list with the reference HS and marks each changed cell "
+                                       "yellow. Everything else in the file stays as it was. Untick lines you do not want to change."
+                                       + (" Merged cells are written with the HS you chose in Step 2." if conflict_groups else ""))
+                            fix_df = check_df[(check_df["Cmp HS"] == "diff") & (check_df["Severity"] != "HSLEN")]
+                            fix_df = fix_df[fix_df["HS Row"].astype(str) != ""]
+                            if group_rows and len(fix_df):      # merged-cell lines are handled by the Step 2 choice, not here
+                                fix_df = fix_df[[(f, int(r)) not in group_rows for f, r in zip(fix_df["File Name"], fix_df["HS Row"])]]
+                            if len(fix_df) == 0 and not group_edits:
+                                st.info("No HS differences that can be corrected automatically.")
+                            corrected_files = []   # (download name, bytes) of every file actually changed
+                            _files_todo = list(fix_df["File Name"].unique()) if len(fix_df) else []
+                            _files_todo += [f for f in group_edits if f not in _files_todo]
+                            for fname in _files_todo:
+                                sub = fix_df[fix_df["File Name"] == fname].reset_index(drop=True)
+                                _gedits = group_edits.get(fname, [])
+                                _gcells = [g for g in conflict_groups if g["file"] == fname
+                                           and merge_pick.get(g["gid"]) not in (None, MERGE_KEEP)]
+                                st.markdown(f"**{fname}** — {len(sub)} line(s) with a different HS"
+                                            + (f" + {len(_gcells)} merged cell(s) unified" if _gcells else ""))
+                                if len(sub):
+                                    table = pd.DataFrame({
+                                        "Apply":                  True,
+                                        "Line":                   sub["Line No"].values,
+                                        "SKU":                    sub["SKU"].values,
+                                        "Description":            sub["PL Description"].values,
+                                        "HS in packing list":     sub["PL HS Code"].values,
+                                        "HS in reference (new)":  sub["Ref HS Code"].values,
+                                        "Duty (ref)":             sub["Ref Duty Rate"].values,
+                                    })
+                                    edited_fix = st.data_editor(
+                                        table, hide_index=True, use_container_width=True, key=f"fix_{fname}",
+                                        disabled=[c for c in table.columns if c != "Apply"],
+                                    )
+                                    chosen = sub[edited_fix["Apply"].values]
+                                else:
+                                    chosen = sub
+                                if _gcells:
+                                    st.dataframe(pd.DataFrame({
+                                        "并格 HS 单元格":   [g["cell"] for g in _gcells],
+                                        "箱单原 HS":        [g["pl_hs"] for g in _gcells],
+                                        "统一写成 (你的选择)": [merge_pick[g["gid"]] for g in _gcells],
+                                        "涉及行数":          [len(g["lines"]) for g in _gcells],
+                                        "其中与参照库不同的 SKU 数": [sum(1 for l in g["lines"] if l["ref_hs"] and l["ref_hs"] != merge_pick[g["gid"]])
+                                                                for g in _gcells],
+                                    }), hide_index=True, use_container_width=True)
+                                if len(chosen) == 0 and not _gedits:
+                                    st.caption("No line selected.")
+                                    continue
+                                _pl_sheet = chosen.iloc[0]["Sheet"] if len(chosen) else _gcells[0]["sheet"]
+                                # lines of this file that are left as they are but have a known reference HS:
+                                # they must not be broken by a change to a HS cell they share with a corrected line
+                                _chosen_rows = {int(r["HS Row"]) for _, r in chosen.iterrows()}
+                                _ctx = []
+                                for _, _d in document_df[document_df["_File"] == fname].iterrows():
+                                    try:
+                                        _row = int(_d["_HS_Row"])
+                                    except Exception:
+                                        continue
+                                    if (fname, _row) in group_rows:      # decided in Step 2
+                                        continue
+                                    _ref = sku_lookup.get(clean_text(_d["SKU Number"]).upper())
+                                    _h = clean_hs(_ref.get("Customs Commodity Code", "")) if _ref else ""
+                                    if _row not in _chosen_rows and _h and not hs_len_abnormal(_h):
+                                        _ctx.append((_row, _d["_HS_Col"], _h))
                                 try:
-                                    _row = int(_d["_HS_Row"])
-                                except Exception:
+                                    new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
+                                        file_bytes[fname], _pl_sheet,
+                                        [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()] + _gedits,
+                                        _ctx,
+                                    )
+                                except Exception as e:
+                                    st.error(f"Could not edit {fname}: {e}")
                                     continue
-                                if _row in _chosen_rows:
-                                    continue
-                                _ref = sku_lookup.get(clean_text(_d["SKU Number"]).upper())
-                                _h = clean_hs(_ref.get("Customs Commodity Code", "")) if _ref else ""
-                                if hs_len_abnormal(_h):
-                                    _h = ""
-                                _ctx.append((_row, _d["_HS_Col"], _h))     # '' = reference unknown, line is left as it is
-                            try:
-                                new_bytes, applied, skipped = apply_hs_corrections_all_sheets(
-                                    file_bytes[fname], chosen.iloc[0]["Sheet"],
-                                    [(int(r["HS Row"]), r["HS Col"], r["Ref HS Code"]) for _, r in chosen.iterrows()],
-                                    _ctx,
-                                )
-                            except Exception as e:
-                                st.error(f"Could not edit {fname}: {e}")
-                                continue
-                            for c, o, n, k in applied:
-                                change_log.append({"File": fname, "Cell": c, "Old HS": o, "New HS": n,
-                                                   "Action": "拆分合并格后修改（每个 SKU 各写各的 HS）" if k == "split" else "修改 HS"})
-                            for cell, why in skipped:
-                                skip_log.append({"File": fname, "Cell": cell, "Reason": why})
-                            if applied:
-                                st.caption("Changed cells: " + ", ".join(f"{c} ({o} → {n})" for c, o, n, _ in applied))
-                            _split_cells = [c for c, o, n, k in applied if k == "split"]
-                            if _split_cells:
-                                st.info(f"🔀 **{fname}**: 合并格已拆开，每个 SKU 各写各的 HS（改动的格标黄）— "
-                                        + ", ".join(_split_cells))
-                            for cell, why in skipped:
-                                st.warning(f"Cell {cell} left unchanged — {why}")
-                            if len(pd.ExcelFile(io.BytesIO(file_bytes[fname])).sheet_names) > 1:
-                                st.caption("Three-in-one file: the same HS correction is made on the invoice, packing list and "
-                                           "contract (same line No. and same description), each changed cell in yellow.")
-                            if applied:
-                                try:     # a line counts as fixed when its HS in the corrected file equals the reference HS
-                                    _nf = _NamedBytes(new_bytes); _nf.name = fname
-                                    _nd = normalize_document_file(_nf)
-                                    _now = {int(a): clean_hs(b) for a, b in zip(_nd["_HS_Row"], _nd["HS Code"]) if str(a) != ""}
-                                    fixed_rows |= {(fname, int(r["HS Row"])) for _, r in chosen.iterrows()
-                                                   if _now.get(int(r["HS Row"])) == clean_hs(r["Ref HS Code"])}
-                                except Exception:
-                                    pass
-                                final_bytes[fname] = new_bytes
-                                stem = fname.rsplit(".", 1)[0]
-                                st.download_button(
-                                    label=f"⬇️ Download corrected packing list — {fname}",
-                                    data=new_bytes,
-                                    file_name=f"{stem}_HS_corrected.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"dl_fix_{fname}",
-                                )
-                                corrected_files.append((f"{stem}_HS_corrected.xlsx", new_bytes))
+                                if applied:
+                                    st.caption("Changed cells: " + ", ".join(f"{c} ({o} → {n})" for c, o, n, _ in applied))
+                                for cell, why in skipped:
+                                    if why == "already has this HS":
+                                        continue
+                                    st.warning(f"Cell {cell} left unchanged — {why}")
+                                if len(pd.ExcelFile(io.BytesIO(file_bytes[fname])).sheet_names) > 1:
+                                    st.caption("Three-in-one file: the same HS correction is made on the invoice, packing list and "
+                                               "contract (same line No. and same description), each changed cell in yellow.")
+                                if applied:
+                                    try:     # a line counts as fixed when its HS in the corrected file equals the new HS
+                                        _nf = _NamedBytes(new_bytes); _nf.name = fname
+                                        _nd = normalize_document_file(_nf)
+                                        _now = {int(a): clean_hs(b) for a, b in zip(_nd["_HS_Row"], _nd["HS Code"]) if str(a) != ""}
+                                        fixed_rows |= {(fname, int(r["HS Row"])) for _, r in chosen.iterrows()
+                                                       if _now.get(int(r["HS Row"])) == clean_hs(r["Ref HS Code"])}
+                                        for (_f, _row), (_hs, _old) in group_choice.items():
+                                            if _f == fname and _now.get(_row) == _hs:
+                                                merge_msgs[(_f, _row)] = f"并格：HS 已按你的选择统一写成 {_hs}"
+                                    except Exception:
+                                        pass
+                                    final_bytes[fname] = new_bytes
+                                    stem = fname.rsplit(".", 1)[0]
+                                    st.download_button(
+                                        label=f"⬇️ Download corrected packing list — {fname}",
+                                        data=new_bytes,
+                                        file_name=f"{stem}_HS_corrected.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"dl_fix_{fname}",
+                                    )
+                                    corrected_files.append((f"{stem}_HS_corrected.xlsx", new_bytes))
+                                for (_f, _row), (_hs, _old) in group_choice.items():
+                                    if _f == fname and (_f, _row) not in merge_msgs:
+                                        merge_msgs[(_f, _row)] = (f"并格：你选的 HS {_hs} 就是箱单当前值，无需修改" if _hs == _old
+                                                                  else "并格：未能修改，见上方提示")
 
-                        # ── One big button: all corrected packing lists in a single ZIP ──
-                        if corrected_files:
-                            import zipfile
-                            zip_buf = io.BytesIO()
-                            used_names = set()
-                            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                                for _name, _data in corrected_files:
-                                    _n, _i = _name, 2
-                                    while _n in used_names:          # never overwrite a same-named file
-                                        _n = _name.replace(".xlsx", f"_{_i}.xlsx")
-                                        _i += 1
-                                    used_names.add(_n)
-                                    zf.writestr(_n, _data)
-                            with zip_slot:
-                                st.download_button(
-                                    label=f"⬇️ Download ALL corrected packing lists ({len(corrected_files)} files, ZIP)",
-                                    data=zip_buf.getvalue(),
-                                    file_name=f"HS_corrected_packing_lists_{date.today().isoformat()}.zip",
-                                    mime="application/zip",
-                                    type="primary",
-                                    use_container_width=True,
-                                    key="dl_fix_all_zip",
-                                )
+                            # ── One big button: all corrected packing lists in a single ZIP ──
+                            if corrected_files:
+                                import zipfile
+                                zip_buf = io.BytesIO()
+                                used_names = set()
+                                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                                    for _name, _data in corrected_files:
+                                        _n, _i = _name, 2
+                                        while _n in used_names:          # never overwrite a same-named file
+                                            _n = _name.replace(".xlsx", f"_{_i}.xlsx")
+                                            _i += 1
+                                        used_names.add(_n)
+                                        zf.writestr(_n, _data)
+                                with zip_slot:
+                                    st.download_button(
+                                        label=f"⬇️ Download ALL corrected packing lists ({len(corrected_files)} files, ZIP)",
+                                        data=zip_buf.getvalue(),
+                                        file_name=f"HS_corrected_packing_lists_{date.today().isoformat()}.zip",
+                                        mime="application/zip",
+                                        type="primary",
+                                        use_container_width=True,
+                                        key="dl_fix_all_zip",
+                                    )
 
             # ── Empty-cell check: runs LAST, on the files after the HS correction ──
             doc_idx = {}
@@ -2149,21 +2255,11 @@ def main():
                     _iss["HS 核对结果"] = [
                         hs_status_for_empty_row(_fname, x["Sheet"], x["Excel row"], x["Line No"],
                                                 pl_sheet_of.get(_fname, ""), _lm, doc_idx, sku_lookup,
-                                                check_idx, fixed_rows, ref_empty)
+                                                check_idx, fixed_rows, ref_empty, merge_msgs)
                         for _, x in _iss.iterrows()]
                 empty_results.append((_fname, _iss, _cnt, _err))
             with empty_slot:
                 render_empty_cell_alert(empty_results)
-                _xl_bytes = build_error_workbook(empty_results, check_df, fixed_rows, change_log, skip_log)
-                if _xl_bytes:
-                    st.caption("Excel 里：整行黄色 = 该 SKU 所在的合并格被拆分过；普通按数据库修改的行不标色。")
-                    st.download_button(
-                        "⬇️ Download all errors as Excel / 下载错误明细 Excel（空格、HS 差异、改动、未改动原因）",
-                        data=_xl_bytes,
-                        file_name=f"RiskCheck_errors_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_error_table",
-                    )
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Manage Reference Data
