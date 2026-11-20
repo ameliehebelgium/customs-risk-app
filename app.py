@@ -1083,6 +1083,11 @@ def apply_hs_cached(file_bytes: bytes, pl_sheet: str, edits: list, ctx: list):
 
 
 @st.cache_data(show_spinner=False, max_entries=500)
+def split_cached(file_bytes: bytes, groups_json: str):
+    return apply_merge_splits_json(file_bytes, groups_json)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
 def check_empty_cached(file_bytes: bytes, fname: str):
     return check_empty_cells(file_bytes, fname)
 
@@ -1186,6 +1191,470 @@ MERGE_KEEP_LABEL = "不改这个并格（保持原样 / 我自己手动拆分）
 MERGE_CUSTOM_LABEL = "统一改成 → 我自己填写（在下面的框里输入 HS）"
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# AUTO SPLIT (自动分格) — cut ONE merged cell into one merged cell per reference HS
+# Layout this relies on (both formats: packing list only, and invoice + packing list + contract):
+#   every SKU has its own row with its own line No.; description / HS / qty / CTNS / weights /
+#   amounts are merged over the SKU rows of one product; the same line Nos exist on every sheet.
+# So nothing is inserted and nothing is renumbered: the merged block is cut into sub-blocks,
+# the new top cells get the HS of their SKUs and their share of qty / CTNS / weights / amounts
+# (by each SKU's own quantity on the packing list). The workbook XML is patched in place.
+# ════════════════════════════════════════════════════════════════════════════════
+
+MERGE_SPLIT = "__split__"   # choice value: split the merged cell, one merged cell per reference HS
+
+
+def merge_split_groups(g: dict) -> list:
+    """How auto split would cut a merged cell: [(hs, [line dicts])], in order of first appearance.
+    SKUs without a usable reference HS stay with the HS currently in the packing list."""
+    order, buckets = [], {}
+    for l in sorted(g["lines"], key=lambda x: int(x["row"])):
+        hs = l["ref_hs"] if (l["ref_hs"] and not hs_len_abnormal(l["ref_hs"])) else l["pl_hs"]
+        if hs not in buckets:
+            buckets[hs] = []
+            order.append(hs)
+        buckets[hs].append(l)
+    return [(hs, buckets[hs]) for hs in order]
+
+
+def merge_split_label(g: dict) -> str:
+    parts = merge_split_groups(g)
+    txt = " ｜ ".join(f"{hs} × {len(ls)} 个 SKU" for hs, ls in parts)
+    return (f"自动分格（不统一 HS）→ 拆成 {len(parts)} 个并格：{txt}　"
+            f"· 数量/箱数/重量/金额按每个 SKU 的数量比例拆分，三合一文件三张表同步拆")
+
+
+class _XlsxPatch:
+    """Small in-place editor for an .xlsx: replaces single cells, merged ranges and adds yellow styles.
+    Everything it does not touch (other cells, formats, widths, print setup, other sheets) stays byte-identical."""
+
+    def __init__(self, file_bytes: bytes):
+        import zipfile, html
+        zin = zipfile.ZipFile(io.BytesIO(file_bytes))
+        self.infos = zin.infolist()
+        self.files = {i.filename: zin.read(i.filename) for i in self.infos}
+        wbxml = self.files["xl/workbook.xml"].decode("utf-8")
+        rels = self.files["xl/_rels/workbook.xml.rels"].decode("utf-8")
+        target_of = {}
+        for rm in re.finditer(r"<Relationship\b[^>]*>", rels):
+            i = re.search(r'\bId="([^"]+)"', rm.group(0))
+            t = re.search(r'\bTarget="([^"]+)"', rm.group(0))
+            if i and t:
+                target_of[i.group(1)] = t.group(1)
+        self.path_of = {}
+        for sm in re.finditer(r"<sheet\b[^>]*>", wbxml):
+            nm = re.search(r'\bname="([^"]*)"', sm.group(0))
+            rid = re.search(r'\br:id="([^"]+)"', sm.group(0))
+            if nm and rid and rid.group(1) in target_of:
+                t = target_of[rid.group(1)]
+                self.path_of[html.unescape(nm.group(1))] = t.lstrip("/") if t.startswith("/") else "xl/" + t
+        self.xml = {}
+        self.styles = self.files["xl/styles.xml"].decode("utf-8")
+        self._fill_id, self._xfs, self._new_xfs, self._yellow = None, None, [], {}
+        self.drop_calc_chain = False
+
+    # ── sheet XML ──
+    def sheet(self, name):
+        if name not in self.xml:
+            self.xml[name] = self.files[self.path_of[name]].decode("utf-8")
+        return self.xml[name]
+
+    @staticmethod
+    def _cell_re(coord):
+        return re.compile(r'<c r="' + coord + r'"(?=[\s/>])([^>]*?)(/>|>(.*?)</c>)', re.S)
+
+    def get_cell(self, name, coord):
+        """(attributes without r, inner xml or '') of a cell, or None if the cell is not in the XML."""
+        m = self._cell_re(coord).search(self.sheet(name))
+        if m is None:
+            return None
+        return m.group(1), (m.group(3) or "")
+
+    def put_cell(self, name, coord, attrs: str, inner: str):
+        """Write a whole cell. attrs: everything after r="..." (e.g. ' s="27" t="inlineStr"')."""
+        new = f'<c r="{coord}"{attrs}' + (f">{inner}</c>" if inner else "/>")
+        xml = self.sheet(name)
+        m = self._cell_re(coord).search(xml)
+        if m:
+            self.xml[name] = xml[:m.start()] + new + xml[m.end():]
+            return
+        from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+        col, row = coordinate_from_string(coord)
+        rm = re.search(r'<row r="' + str(row) + r'"(?=[\s/>])([^>]*?)(/>|>(.*?)</row>)', xml, re.S)
+        if rm is None:
+            raise RuntimeError(f"row {row} not found in sheet XML")
+        body = rm.group(3) or ""
+        pos = len(body)
+        for cm in re.finditer(r'<c r="([A-Z]+)\d+"', body):        # keep the cells in column order
+            if column_index_from_string(cm.group(1)) > column_index_from_string(col):
+                pos = cm.start()
+                break
+        body = body[:pos] + new + body[pos:]
+        self.xml[name] = xml[:rm.start()] + f'<row r="{row}"{rm.group(1)}>{body}</row>' + xml[rm.end():]
+
+    def set_merges(self, name, remove: list, add: list):
+        xml = self.sheet(name)
+        mm = re.search(r'<mergeCells\b[^>]*>(.*?)</mergeCells>', xml, re.S)
+        if mm is None:
+            raise RuntimeError("no merged cells in sheet XML")
+        body = mm.group(1)
+        for ref in remove:
+            body, n = re.subn(r'<mergeCell ref="' + ref + r'"\s*/>', "", body)
+            if n != 1:
+                raise RuntimeError(f"merged range {ref} not found in sheet XML")
+        body += "".join(f'<mergeCell ref="{ref}"/>' for ref in add)
+        cnt = len(re.findall(r"<mergeCell\b", body))
+        self.xml[name] = xml[:mm.start()] + f'<mergeCells count="{cnt}">{body}</mergeCells>' + xml[mm.end():]
+
+    # ── styles ──
+    def yellow(self, s_idx: int) -> int:
+        """Index of a copy of cell style s_idx with a yellow fill (same look as the HS correction)."""
+        if self._xfs is None:
+            fm = re.search(r'<fills count="(\d+)">(.*?)</fills>', self.styles, re.S)
+            self._fill_id = int(fm.group(1))
+            new_fill = '<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill>'
+            self.styles = self.styles.replace(fm.group(0), f'<fills count="{self._fill_id + 1}">{fm.group(2)}{new_fill}</fills>')
+            xm = re.search(r'<cellXfs count="(\d+)">(.*?)</cellXfs>', self.styles, re.S)
+            self._xfs = re.findall(r"<xf\b[^>]*?(?:/>|>.*?</xf>)", xm.group(2), re.S)
+        if s_idx not in self._yellow:
+            xf = self._xfs[s_idx]
+            head_end = xf.index(">")
+            head, rest = xf[:head_end], xf[head_end:]
+            head = re.sub(r'\sfillId="\d+"', "", head)
+            head = re.sub(r'\sapplyFill="\d+"', "", head)
+            head = head.replace("<xf", f'<xf fillId="{self._fill_id}" applyFill="1"', 1)
+            if not rest.startswith("/>") and head.endswith("/"):
+                head = head[:-1]; rest = "/" + rest
+            self._new_xfs.append(head + rest)
+            self._yellow[s_idx] = len(self._xfs) + len(self._new_xfs) - 1
+        return self._yellow[s_idx]
+
+    def save(self) -> bytes:
+        import zipfile
+        files = dict(self.files)
+        for name, xml in self.xml.items():
+            files[self.path_of[name]] = xml.encode("utf-8")
+        styles = self.styles
+        if self._new_xfs:
+            xm = re.search(r'<cellXfs count="(\d+)">(.*?)</cellXfs>', styles, re.S)
+            styles = styles.replace(xm.group(0), f'<cellXfs count="{len(self._xfs) + len(self._new_xfs)}">'
+                                                 f'{xm.group(2)}{"".join(self._new_xfs)}</cellXfs>')
+        files["xl/styles.xml"] = styles.encode("utf-8")
+        # values changed -> let Excel recalculate every formula (totals, unit prices) when the file is opened
+        wbxml = files["xl/workbook.xml"].decode("utf-8")
+        cm = re.search(r"<calcPr\b[^>]*?/?>", wbxml)
+        if cm and "fullCalcOnLoad" not in cm.group(0):
+            wbxml = wbxml.replace(cm.group(0), cm.group(0).replace("<calcPr", '<calcPr fullCalcOnLoad="1"', 1))
+        elif cm is None:
+            anchor = "</sheets>" if "</definedNames>" not in wbxml else "</definedNames>"
+            wbxml = wbxml.replace(anchor, anchor + '<calcPr fullCalcOnLoad="1"/>', 1)
+        files["xl/workbook.xml"] = wbxml.encode("utf-8")
+        drop = set()
+        if self.drop_calc_chain and "xl/calcChain.xml" in files:     # formula cells moved: Excel rebuilds the chain
+            drop.add("xl/calcChain.xml")
+            rels = files["xl/_rels/workbook.xml.rels"].decode("utf-8")
+            rels = re.sub(r'<Relationship\b[^>]*Target="[^"]*calcChain\.xml"[^>]*/>', "", rels)
+            files["xl/_rels/workbook.xml.rels"] = rels.encode("utf-8")
+            ct = files["[Content_Types].xml"].decode("utf-8")
+            ct = re.sub(r'<Override\b[^>]*PartName="/xl/calcChain\.xml"[^>]*/>', "", ct)
+            files["[Content_Types].xml"] = ct.encode("utf-8")
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in self.infos:
+                if item.filename not in drop:
+                    zout.writestr(item, files[item.filename])
+        return out.getvalue()
+
+
+def _split_num_text(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return repr(v) if isinstance(v, float) else str(v)
+
+
+def _decimals(v) -> int:
+    s = f"{float(v):.6f}".rstrip("0")
+    return len(s.split(".")[1]) if "." in s else 0
+
+
+def _split_by_share(total, weights: list, decimals: int) -> list:
+    """total cut in proportion to weights, rounded; the last part takes the rounding rest so the sum is exact."""
+    W = float(sum(weights))
+    parts = [round(total * w / W, decimals) for w in weights[:-1]]
+    parts.append(round(total - sum(parts), decimals))
+    if decimals == 0:
+        parts = [int(p) for p in parts]
+    return parts
+
+
+def _split_int_by_share(total: int, weights: list) -> list:
+    """Whole numbers (cartons) in proportion to weights, largest remainder, sum stays exact."""
+    W = float(sum(weights))
+    raw = [total * w / W for w in weights]
+    out = [int(x) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: -(raw[i] - out[i]))[:total - sum(out)]:
+        out[i] += 1
+    return out
+
+
+def _translate_formula(f_xml: str, src: str, dst: str) -> str:
+    """Formula text of an XML <f> element moved from cell src to cell dst."""
+    import html
+    from openpyxl.formula.translate import Translator
+    from xml.sax.saxutils import escape as _esc
+    return _esc(Translator("=" + html.unescape(f_xml), origin=src).translate_formula(dst)[1:])
+
+
+def _plan_sheet_split(ws, patch, sheet, rows, field_of_col, no_col, sub_sizes, perm, sub_hs, sub_qty, total_qty):
+    """Write the split of one merged block on one sheet into `patch`.
+    rows: the block's Excel rows (contiguous, top to bottom); perm[k] = which old row offset goes to new offset k;
+    sub_sizes / sub_hs / sub_qty: per new merged cell. Returns [(cell, old, new)] for the report.
+    Raises RuntimeError (nothing is written by the caller) when the block does not have the expected shape."""
+    from openpyxl.utils import get_column_letter, column_index_from_string
+    from xml.sax.saxutils import escape as _esc
+    R0, R1, n = rows[0], rows[-1], len(rows)
+    no_idx = column_index_from_string(no_col)
+
+    # merged ranges of this block: one per column, exactly over the block's rows
+    block_merges, mcols = [], set()
+    for mr in ws.merged_cells.ranges:
+        if mr.max_row < R0 or mr.min_row > R1:
+            continue
+        if mr.min_row == R0 and mr.max_row == R1 and mr.min_col == mr.max_col:
+            block_merges.append(mr)
+            mcols.add(mr.min_col)
+        else:
+            raise RuntimeError(f"{sheet}!{mr.coord}: 这个并格里还有形状不一样的合并单元格，不能自动拆")
+    if no_idx in mcols:
+        raise RuntimeError(f"{sheet}: 行号 No. 也被合并了，和预期的格式不一样")
+    if not any(field_of_col.get(c) == "hs" for c in mcols):
+        raise RuntimeError(f"{sheet}: HS 列不是这个并格的合并单元格")
+
+    changes = []
+    starts = [R0 + sum(sub_sizes[:k]) for k in range(len(sub_sizes))]
+
+    # 1) SKU rows whose HS groups are not next to each other: move their own (unmerged) cells, line No. stays
+    if perm != list(range(n)):
+        patch.drop_calc_chain = True
+        own_cols = [c for c in range(1, ws.max_column + 1) if c not in mcols and c != no_idx]
+        saved = {}
+        for k in range(n):
+            for c in own_cols:
+                saved[(k, c)] = patch.get_cell(sheet, f"{get_column_letter(c)}{rows[k]}")
+        for k in range(n):
+            src_k = perm[k]
+            if src_k == k:
+                continue
+            for c in own_cols:
+                L = get_column_letter(c)
+                src = saved[(src_k, c)]
+                dst_coord, src_coord = f"{L}{rows[k]}", f"{L}{rows[src_k]}"
+                if src is None:
+                    dst = saved[(k, c)]
+                    if dst is not None:          # keep the cell's format, empty it
+                        sm = re.search(r'\ss="\d+"', dst[0])
+                        patch.put_cell(sheet, dst_coord, sm.group(0) if sm else "", "")
+                    continue
+                attrs, inner = src
+                if 't="shared"' in inner:
+                    raise RuntimeError(f"{sheet}!{src_coord}: 共享公式，不能自动移动")
+                inner = re.sub(r"<f>(.*?)</f>", lambda m: f"<f>{_translate_formula(m.group(1), src_coord, dst_coord)}</f>",
+                               inner, flags=re.S)
+                inner = re.sub(r"<v>.*?</v>", "", inner, flags=re.S) if "<f>" in inner else inner
+                patch.put_cell(sheet, dst_coord, attrs, inner)
+
+    # 2) the merged columns: new merged ranges + the values of every new top cell
+    for mr in block_merges:
+        c = mr.min_col
+        L = get_column_letter(c)
+        field = field_of_col.get(c, "")
+        top_coord = f"{L}{R0}"
+        orig = ws.cell(R0, c).value
+        raw = patch.get_cell(sheet, top_coord)
+        if raw is None:
+            raise RuntimeError(f"{sheet}!{top_coord}: 单元格不在文件里")
+        sm = re.search(r'\ss="(\d+)"', raw[0])
+        s_idx = int(sm.group(1)) if sm else 0
+        is_formula = isinstance(orig, str) and orig.startswith("=")
+        num = None
+        if not is_formula and field not in ("hs", "desc", "no", "sku"):
+            if isinstance(orig, (int, float)) and not isinstance(orig, bool):
+                num = float(orig)
+            elif isinstance(orig, str) and re.fullmatch(r"\s*-?\d+(\.\d+)?\s*", orig):
+                num = float(orig)
+
+        if field == "hs":
+            old = clean_hs(orig)
+            vals = [("str", h, h != old) for h in sub_hs]
+        elif is_formula:
+            vals = [("formula", k, False) for k in range(len(sub_sizes))]
+        elif num is not None and field == "qty":
+            if abs(num - total_qty) > 1e-6:
+                raise RuntimeError(f"{sheet}!{top_coord}: 并格数量 {orig} 和每个 SKU 的数量合计 {total_qty:g} 对不上")
+            vals = [("num", q, True) for q in sub_qty]
+        elif num is not None and field == "ctns":
+            if abs(num - total_qty) < 1e-6:
+                parts = list(sub_qty)                      # 1 SKU piece = 1 carton
+            elif float(num).is_integer():
+                parts = _split_int_by_share(int(num), sub_qty)
+            else:
+                parts = _split_by_share(num, sub_qty, _decimals(num))
+            vals = [("num", p, True) for p in parts]
+        elif num is not None and field == "unit":
+            vals = [("num", orig, False) for _ in sub_sizes]    # same unit price on every part
+        elif num is not None:                                    # total, G.W., N.W., CBM and other numbers
+            d = {"total": 2, "gw": min(max(_decimals(num), 2), 3), "nw": min(max(_decimals(num), 2), 3),
+                 "cbm": min(max(_decimals(num), 3), 4)}.get(field, _decimals(num))
+            parts = _split_by_share(num, sub_qty, d)
+            if any(p < 0 for p in parts):
+                raise RuntimeError(f"{sheet}!{top_coord}: 按比例拆出负数，停止")
+            vals = [("num", p, True) for p in parts]
+        else:                                                    # description, origin, other text: same on every part
+            vals = [("copy", None, False) for _ in sub_sizes]
+
+        new_refs = []
+        for k, (kind, v, yellow) in enumerate(vals):
+            s0, z = starts[k], sub_sizes[k]
+            if z > 1:
+                new_refs.append(f"{L}{s0}:{L}{s0 + z - 1}")
+            coord = f"{L}{s0}"
+            s_new = patch.yellow(s_idx) if yellow else s_idx
+            if kind == "str":
+                patch.put_cell(sheet, coord, f' s="{s_new}" t="inlineStr"', f"<is><t>{_esc(str(v))}</t></is>")
+                changes.append((f"{sheet}!{coord}", clean_hs(orig), str(v)))
+            elif kind == "num":
+                patch.put_cell(sheet, coord, f' s="{s_new}"', f"<v>{_split_num_text(v)}</v>")
+                if field in ("qty", "ctns", "gw", "nw", "cbm", "total"):
+                    changes.append((f"{sheet}!{coord}", _split_num_text(orig) if k == 0 else "", _split_num_text(v)))
+            elif kind == "formula":
+                if k == 0:
+                    continue                                     # the top formula stays where it is
+                f = re.search(r"<f>(.*?)</f>", raw[1], re.S)
+                if f is None:
+                    raise RuntimeError(f"{sheet}!{top_coord}: 共享公式，不能自动拆")
+                patch.put_cell(sheet, coord, f' s="{s_new}"', f"<f>{_translate_formula(f.group(1), top_coord, coord)}</f>")
+            else:
+                if k == 0:
+                    continue
+                attrs = re.sub(r'\ss="\d+"', "", raw[0])
+                patch.put_cell(sheet, coord, f' s="{s_new}"{attrs}', raw[1])
+        patch.set_merges(sheet, [mr.coord], new_refs)
+    return changes
+
+
+def apply_merge_splits(file_bytes: bytes, groups: list):
+    """Auto split (自动分格) of the chosen merged HS cells of ONE file, on the packing list and, in a
+    three-in-one workbook, on the invoice and contract as well (same line Nos).
+    groups: conflict-group dicts (from find_merged_hs_conflicts) the user chose to split.
+    A merged cell is split on every sheet or on none: if any sheet does not line up, that cell is left alone.
+    Returns (new_bytes, applied [(cell, old, new, n)], skipped [(where, why)], row_hs {(sheet, pl row): hs})."""
+    import openpyxl
+    from openpyxl.utils import column_index_from_string, get_column_letter
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    applied, skipped, row_hs = [], [], {}
+    good_bytes = file_bytes
+
+    def _norm(x):
+        return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+
+    for g in groups:
+        where = f"{g['sheet']}!{g['cell']}"
+        try:
+            patch = _XlsxPatch(good_bytes)
+            ws = wb[g["sheet"]]
+            mr = next((m for m in ws.merged_cells.ranges if g["cell"] in m), None)
+            if mr is None:
+                raise RuntimeError("HS 单元格不是合并单元格（空白向下共用的格式不能自动拆）")
+            rows = list(range(mr.min_row, mr.max_row + 1))
+            if sorted(int(l["row"]) for l in g["lines"]) != rows:
+                raise RuntimeError("并格的行和箱单解析出来的 SKU 行对不上")
+            tbl = _find_doc_table(ws)
+            if tbl is None:
+                raise RuntimeError("找不到箱单表头（No. / Description / HS）")
+
+            def fields(sheet_ws, header_row):
+                return {c: _cc_classify(sheet_ws.cell(header_row, c).value) for c in range(1, sheet_ws.max_column + 1)}
+
+            # each SKU's own quantity: the number right of the SKU cell (column without header on the packing list)
+            line_of_row = {int(l["row"]): l for l in g["lines"]}
+            sku_col = None
+            for r in rows:
+                sku = line_of_row[r]["sku"].strip().upper()
+                if sku:
+                    sku_col = next((c for c in range(1, ws.max_column + 1)
+                                    if str(ws.cell(r, c).value or "").strip().upper() == sku), None)
+                    break
+            if sku_col is None:
+                raise RuntimeError("找不到 SKU 列")
+            qty = {}
+            for r in rows:
+                v = ws.cell(r, sku_col + 1).value
+                try:
+                    qty[r] = float(v)
+                except Exception:
+                    raise RuntimeError(f"第 {r} 行找不到这个 SKU 自己的数量（SKU 右边一格），无法按比例拆")
+            total_qty = sum(qty.values())
+            if total_qty <= 0:
+                raise RuntimeError("SKU 数量合计为 0，无法按比例拆")
+
+            parts = merge_split_groups(g)
+            new_order = [int(l["row"]) for _, ls in parts for l in ls]          # old rows, in their new order
+            perm = [rows.index(r) for r in new_order]
+            sub_sizes = [len(ls) for _, ls in parts]
+            sub_hs = [hs for hs, _ in parts]
+            sub_qty = [sum(qty[int(l["row"])] for l in ls) for _, ls in parts]
+            sub_qty = [int(q) if float(q).is_integer() else q for q in sub_qty]
+
+            # line Nos of the block (they stay where they are) -> same lines on the other sheets
+            nos = []
+            for r in rows:
+                try:
+                    nos.append(int(float(str(ws[f"{tbl['no_col']}{r}"].value).strip())))
+                except Exception:
+                    raise RuntimeError(f"第 {r} 行没有行号 No.")
+            pl_desc = _norm(_merged_top_value(ws, f"{tbl['desc_col']}{rows[0]}"))
+
+            changes = _plan_sheet_split(ws, patch, g["sheet"], rows, fields(ws, tbl["header_row"]), tbl["no_col"],
+                                        sub_sizes, perm, sub_hs, sub_qty, total_qty)
+            others = []
+            for name in wb.sheetnames:
+                if name == g["sheet"]:
+                    continue
+                ows = wb[name]
+                otbl = _find_doc_table(ows)
+                if otbl is None:
+                    continue                                    # not an invoice / contract sheet
+                by_no = _line_rows(ows, otbl)
+                orows = [by_no.get(n) for n in nos]
+                if None in orows:
+                    raise RuntimeError(f"「{name}」里找不到行号 {nos[orows.index(None)]}")
+                if orows != list(range(orows[0], orows[0] + len(orows))):
+                    raise RuntimeError(f"「{name}」里行号 {nos[0]}–{nos[-1]} 不是连续的行")
+                if _norm(_merged_top_value(ows, f"{otbl['desc_col']}{orows[0]}")) != pl_desc:
+                    raise RuntimeError(f"「{name}」行号 {nos[0]} 的描述和箱单不一样")
+                changes += _plan_sheet_split(ows, patch, name, orows, fields(ows, otbl["header_row"]), otbl["no_col"],
+                                             sub_sizes, perm, sub_hs, sub_qty, total_qty)
+                others.append(name)
+            good_bytes = patch.save()                           # this merged cell is done on every sheet
+        except Exception as e:
+            skipped.append((where, f"自动分格没有做（这个并格保持原样）：{e}"))
+            continue
+        summary = " ｜ ".join(f"{h} × {z} 行" for h, z in zip(sub_hs, sub_sizes))
+        applied.append((where, g["pl_hs"], f"自动分格 → {summary}"
+                        + (f"（{'、'.join(others)} 同步拆分）" if others else "（只有箱单）"), len(g["lines"])))
+        applied += [(c, o or "—", n, 0) for c, o, n in changes if o != n]
+        k = 0
+        for size, hs in zip(sub_sizes, sub_hs):
+            for r in rows[k:k + size]:
+                row_hs[(g["sheet"], r)] = hs
+            k += size
+    return good_bytes, applied, skipped, row_hs
+
+
+def apply_merge_splits_json(file_bytes: bytes, groups_json: str):
+    return apply_merge_splits(file_bytes, json.loads(groups_json))
+
+
 def _show_parsed_preview(document_df: pd.DataFrame):
     with st.expander("📄 Preview parsed packing list lines"):
         st.dataframe(document_df, use_container_width=True, hide_index=True)
@@ -1248,7 +1717,8 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
     for _msg in st.session_state.pop("_merge_flash", []):
         st.error(_msg)
     st.warning(f"共 **{len(conflict_groups)}** 个并格：同一个 HS 单元格下的 SKU，在参照数据库里的 HS **不一样**，自动改会互相打架。"
-               f"为每个并格选一个 HS（保留并格，不拆分，整格统一写成这一个）并点它下面的确认键，确认后这一项就会消失。"
+               f"为每个并格选一个处理方式：**自动分格**（按参照库 HS 拆成几个并格，各写各的 HS），或整格**统一写成一个 HS**，"
+               f"然后点它下面的确认键，确认后这一项就会消失。"
                f"**还剩 {len(pending)} 个待确认。**  🔒 只改这次上传的单据文件，**不会修改参照数据库**。")
 
     if pending:
@@ -1272,7 +1742,8 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
                         }), hide_index=True, use_container_width=True)
                         picks[gkey(g)] = st.radio(
                             "这个并格的 HS 怎么处理？",
-                            list(_labels_of[gkey(g)]) + [MERGE_CUSTOM_LABEL, MERGE_KEEP_LABEL], index=None,
+                            [merge_split_label(g)] + list(_labels_of[gkey(g)]) + [MERGE_CUSTOM_LABEL, MERGE_KEEP_LABEL],
+                            index=None,
                             key=wkey("mergepick", g))
                         customs[gkey(g)] = st.text_input(
                             "自定义 HS（只在选了「统一改成 → 我自己填写」时使用）", key=wkey("mergecustom", g),
@@ -1291,6 +1762,8 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
                     continue
                 if pick == MERGE_KEEP_LABEL:
                     dec[gkey(g)] = MERGE_KEEP
+                elif pick == merge_split_label(g):
+                    dec[gkey(g)] = MERGE_SPLIT
                 elif pick == MERGE_CUSTOM_LABEL:
                     hs = clean_hs(customs[gkey(g)])
                     if not (hs.isdigit() and len(hs) == HS_EXPECTED_LEN):
@@ -1312,7 +1785,9 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
                 ch = dec[gkey(g)]
                 c1, c2 = st.columns([5, 1])
                 c1.markdown(f"**{conflict_groups.index(g) + 1}.** {g['file']} · `{g['cell']}` → "
-                            + ("**不改，保持原样**" if ch == MERGE_KEEP else f"统一写 **{ch}**"))
+                            + ("**不改，保持原样**" if ch == MERGE_KEEP
+                               else "**自动分格**：" + " ｜ ".join(f"{h} × {len(ls)} 个 SKU" for h, ls in merge_split_groups(g))
+                               if ch == MERGE_SPLIT else f"统一写 **{ch}**"))
                 if c2.button("↩️ 撤销", key=wkey("mergeundo", g)):
                     dec.pop(gkey(g), None)
                     st.rerun()
@@ -1615,7 +2090,8 @@ def build_check_report_xlsx(check_df, empty_results, conflict_groups, merge_pick
         rows = []
         for g in conflict_groups:
             ch = merge_pick.get(g["gid"])
-            decision = "未确认" if ch is None else ("不改，保持原样" if ch == MERGE_KEEP else f"统一写 {ch}")
+            decision = ("未确认" if ch is None else "不改，保持原样" if ch == MERGE_KEEP
+                        else "自动分格（按参照库 HS 拆开）" if ch == MERGE_SPLIT else f"统一写 {ch}")
             for l in g["lines"]:
                 rows.append({"文件 File": g["file"], "工作表": g["sheet"], "HS 单元格": g["cell"],
                              "箱单当前 HS": g["pl_hs"], "Excel 行": l["row"], "SKU": l["sku"], "箱单描述": l["desc"],
@@ -2284,8 +2760,17 @@ def main():
                             # what the user decided, per file
                             group_edits, group_choice = {}, {}     # file -> [(row, col, hs)] ; (file, row) -> (hs, original hs)
                             _override, _kept = {}, set()
+                            split_groups, _split_keys = {}, set()  # file -> [groups to auto split]
                             for g in conflict_groups:
                                 _ch = merge_pick.get(g["gid"])
+                                if _ch == MERGE_SPLIT:
+                                    split_groups.setdefault(g["file"], []).append(g)
+                                    for _hs, _ls in merge_split_groups(g):
+                                        for l in _ls:
+                                            _k = (g["file"], str(l["row"]))
+                                            _override[_k] = (_hs, l["pl_hs"])
+                                            _split_keys.add(_k)
+                                    continue
                                 for l in g["lines"]:
                                     _k = (g["file"], str(l["row"]))
                                     if _ch == MERGE_KEEP:
@@ -2311,7 +2796,9 @@ def main():
                                         for _, _r in check_eff.iterrows():
                                             _k = (_r["File Name"], str(_r["HS Row"]))
                                             _rs = _r["Reason"]
-                                            if _k in _override:
+                                            if _k in _split_keys:
+                                                _rs += f" | 自动分格：此 SKU 所在新并格 HS {_override[_k][0]}（箱单原 HS {_override[_k][1]}）"
+                                            elif _k in _override:
                                                 _rs += f" | 并格统一：箱单原 HS {_override[_k][1]} → 统一写 {_override[_k][0]}（人工选择）"
                                             elif _k in _kept:
                                                 _rs += " | 并格：你选择不改，箱单 HS 保持原样"
@@ -2331,25 +2818,30 @@ def main():
                             st.markdown("### ✏️ 修改明细 / Corrected packing lists — what is changed")
                             st.caption("Replaces the HS in the packing list with the reference HS and marks each changed cell "
                                        "yellow. Everything else in the file stays as it was. Untick lines you do not want to change."
-                                       + (" Merged cells are written with the HS you chose." if conflict_groups else ""))
+                                       + (" Merged cells are written with the HS you chose; auto-split cells are cut into one "
+                                          "merged cell per HS (invoice / contract too), qty / CTNS / weights / amounts split "
+                                          "by each SKU's quantity." if conflict_groups else ""))
                             fix_df = check_df[(check_df["Cmp HS"] == "diff") & (check_df["Severity"] != "HSLEN")]
                             fix_df = fix_df[fix_df["HS Row"].astype(str) != ""]
                             if group_rows and len(fix_df):      # merged-cell lines are handled by the merged-cell choice, not here
                                 fix_df = fix_df[[(f, int(r)) not in group_rows for f, r in zip(fix_df["File Name"], fix_df["HS Row"])]]
-                            if len(fix_df) == 0 and not group_edits:
+                            if len(fix_df) == 0 and not group_edits and not split_groups:
                                 with dl_slot:
                                     st.info("No HS differences that can be corrected automatically.")
                             corrected_files = []   # (download name, bytes) of every file actually changed
                             dl_entries = []        # (file, applied, skipped, download name, bytes)
                             _files_todo = list(fix_df["File Name"].unique()) if len(fix_df) else []
                             _files_todo += [f for f in group_edits if f not in _files_todo]
+                            _files_todo += [f for f in split_groups if f not in _files_todo]
                             for fname in _files_todo:
                                 sub = fix_df[fix_df["File Name"] == fname].reset_index(drop=True)
                                 _gedits = group_edits.get(fname, [])
                                 _gcells = [g for g in conflict_groups if g["file"] == fname
-                                           and merge_pick.get(g["gid"]) not in (None, MERGE_KEEP)]
+                                           and merge_pick.get(g["gid"]) not in (None, MERGE_KEEP, MERGE_SPLIT)]
+                                _sgroups = split_groups.get(fname, [])
                                 st.markdown(f"**{fname}** — {len(sub)} line(s) with a different HS"
-                                            + (f" + {len(_gcells)} merged cell(s) unified" if _gcells else ""))
+                                            + (f" + {len(_gcells)} merged cell(s) unified" if _gcells else "")
+                                            + (f" + {len(_sgroups)} merged cell(s) auto-split" if _sgroups else ""))
                                 if len(sub):
                                     table = pd.DataFrame({
                                         "Apply":                  True,
@@ -2376,8 +2868,44 @@ def main():
                                         "其中与参照库不同的 SKU 数": [sum(1 for l in g["lines"] if l["ref_hs"] and l["ref_hs"] != merge_pick[g["gid"]])
                                                                 for g in _gcells],
                                     }), hide_index=True, use_container_width=True)
-                                if len(chosen) == 0 and not _gedits:
+                                if _sgroups:
+                                    st.dataframe(pd.DataFrame({
+                                        "并格 HS 单元格": [g["cell"] for g in _sgroups],
+                                        "箱单原 HS":      [g["pl_hs"] for g in _sgroups],
+                                        "自动分格 →":     [" ｜ ".join(f"{h} × {len(ls)} 个 SKU" for h, ls in merge_split_groups(g))
+                                                          for g in _sgroups],
+                                    }), hide_index=True, use_container_width=True)
+                                if len(chosen) == 0 and not _gedits and not _sgroups:
                                     st.caption("No line selected.")
+                                    continue
+                                # 1) auto split first (changes merged ranges), 2) then the HS edits on the split file
+                                _base, _s_app, _s_skip = file_bytes[fname], [], []
+                                if _sgroups:
+                                    try:
+                                        _base, _s_app, _s_skip, _s_rows = split_cached(
+                                            file_bytes[fname],
+                                            json.dumps([{k: g[k] for k in ("gid", "file", "sheet", "cell", "pl_hs", "lines")}
+                                                        for g in _sgroups], default=str))
+                                    except Exception as e:
+                                        _s_rows = {}
+                                        _s_skip = [(fname, f"自动分格出错，文件没有拆：{e}")]
+                                    for (_sh, _row), _hs in _s_rows.items():
+                                        merge_msgs[(fname, _row)] = f"并格：已自动分格，此行所在新并格 HS 写成 {_hs}"
+                                    _done = {a[0] for a in _s_app}
+                                    for g in _sgroups:
+                                        if f"{g['sheet']}!{g['cell']}" not in _done:
+                                            for l in g["lines"]:
+                                                merge_msgs[(fname, int(l["row"]))] = "并格：自动分格没有做成，HS 未改，见上方提示"
+                                if len(chosen) == 0 and not _gedits:
+                                    new_bytes, applied, skipped = _base, [], []
+                                    applied, skipped = _s_app + applied, _s_skip + skipped
+                                    _skipped = list(skipped)
+                                    if applied:
+                                        final_bytes[fname] = new_bytes
+                                        corrected_files.append((f"{fname.rsplit('.', 1)[0]}_HS_corrected.xlsx", new_bytes))
+                                    if applied or _skipped:
+                                        dl_entries.append((fname, applied, _skipped,
+                                                           f"{fname.rsplit('.', 1)[0]}_HS_corrected.xlsx" if applied else None, new_bytes))
                                     continue
                                 _pl_sheet = chosen.iloc[0]["Sheet"] if len(chosen) else _gcells[0]["sheet"]
                                 # lines of this file that are left as they are but have a known reference HS:
@@ -2397,13 +2925,14 @@ def main():
                                         _ctx.append((_row, _d["_HS_Col"], _h))
                                 try:
                                     new_bytes, applied, skipped = apply_hs_cached(
-                                        file_bytes[fname], _pl_sheet,
+                                        _base, _pl_sheet,
                                         [(int(r["HS Row"]), str(r["HS Col"]), str(r["Ref HS Code"])) for _, r in chosen.iterrows()] + _gedits,
                                         _ctx,
                                     )
                                 except Exception as e:
                                     st.error(f"Could not edit {fname}: {e}")
                                     continue
+                                applied, skipped = _s_app + list(applied), _s_skip + list(skipped)
                                 _skipped = [(c, w) for c, w in skipped if w != "already has this HS"]
                                 if applied:
                                     try:     # a line counts as fixed when its HS in the corrected file equals the new HS
