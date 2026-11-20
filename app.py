@@ -1142,6 +1142,7 @@ def find_merged_hs_conflicts(file_bytes: bytes, fname: str, doc_rows: pd.DataFra
     for (sheet, cell), members in groups.items():
         if len(members) < 2:
             continue
+        ws = wb[sheet]
         lines, ref_count, ref_duty = [], {}, {}
         for row, r in members:
             sku = clean_text(r.get("SKU Number", ""))
@@ -1165,7 +1166,18 @@ def find_merged_hs_conflicts(file_bytes: bytes, fname: str, doc_rows: pd.DataFra
                 ref_count[ref_hs] = ref_count.get(ref_hs, 0) + 1
                 if duty:
                     ref_duty.setdefault(ref_hs, set()).add(duty)
+            sku_qty = ""
+            if sku:                 # each SKU's own quantity: the number right of the SKU cell (no header)
+                for c in range(1, ws.max_column):
+                    if str(ws.cell(row, c).value or "").strip().upper() == sku.upper():
+                        v = ws.cell(row, c + 1).value
+                        try:
+                            sku_qty = int(float(v)) if float(v).is_integer() else float(v)
+                        except Exception:
+                            pass
+                        break
             lines.append({"row": row, "col": r.get("_HS_Col", ""), "line": r.get("Line No", ""), "sku": sku,
+                          "sku_qty": sku_qty,
                           "desc": clean_text(r.get("Product Description", "")),
                           "pl_hs": pl_hs, "ref_hs": ref_hs, "ref_duty": duty, "state": state})
         if len(ref_count) < 2:
@@ -1405,7 +1417,8 @@ def _translate_formula(f_xml: str, src: str, dst: str) -> str:
     return _esc(Translator("=" + html.unescape(f_xml), origin=src).translate_formula(dst)[1:])
 
 
-def _plan_sheet_split(ws, patch, sheet, rows, field_of_col, no_col, sub_sizes, perm, sub_hs, sub_qty, total_qty):
+def _plan_sheet_split(ws, patch, sheet, rows, field_of_col, no_col, sub_sizes, perm, sub_hs, sub_qty, total_qty,
+                      collect=None):
     """Write the split of one merged block on one sheet into `patch`.
     rows: the block's Excel rows (contiguous, top to bottom); perm[k] = which old row offset goes to new offset k;
     sub_sizes / sub_hs / sub_qty: per new merged cell. Returns [(cell, old, new)] for the report.
@@ -1515,6 +1528,8 @@ def _plan_sheet_split(ws, patch, sheet, rows, field_of_col, no_col, sub_sizes, p
         new_refs = []
         for k, (kind, v, yellow) in enumerate(vals):
             s0, z = starts[k], sub_sizes[k]
+            if collect is not None and kind in ("str", "num"):
+                collect.append((sheet, k, field, v))
             if z > 1:
                 new_refs.append(f"{L}{s0}:{L}{s0 + z - 1}")
             coord = f"{L}{s0}"
@@ -1542,7 +1557,7 @@ def _plan_sheet_split(ws, patch, sheet, rows, field_of_col, no_col, sub_sizes, p
     return changes
 
 
-def apply_merge_splits(file_bytes: bytes, groups: list):
+def apply_merge_splits(file_bytes: bytes, groups: list, collect=None):
     """Auto split (自动分格) of the chosen merged HS cells of ONE file, on the packing list and, in a
     three-in-one workbook, on the invoice and contract as well (same line Nos).
     groups: conflict-group dicts (from find_merged_hs_conflicts) the user chose to split.
@@ -1615,7 +1630,7 @@ def apply_merge_splits(file_bytes: bytes, groups: list):
             pl_desc = _norm(_merged_top_value(ws, f"{tbl['desc_col']}{rows[0]}"))
 
             changes = _plan_sheet_split(ws, patch, g["sheet"], rows, fields(ws, tbl["header_row"]), tbl["no_col"],
-                                        sub_sizes, perm, sub_hs, sub_qty, total_qty)
+                                        sub_sizes, perm, sub_hs, sub_qty, total_qty, collect)
             others = []
             for name in wb.sheetnames:
                 if name == g["sheet"]:
@@ -1633,7 +1648,7 @@ def apply_merge_splits(file_bytes: bytes, groups: list):
                 if _norm(_merged_top_value(ows, f"{otbl['desc_col']}{orows[0]}")) != pl_desc:
                     raise RuntimeError(f"「{name}」行号 {nos[0]} 的描述和箱单不一样")
                 changes += _plan_sheet_split(ows, patch, name, orows, fields(ows, otbl["header_row"]), otbl["no_col"],
-                                             sub_sizes, perm, sub_hs, sub_qty, total_qty)
+                                             sub_sizes, perm, sub_hs, sub_qty, total_qty, collect)
                 others.append(name)
             good_bytes = patch.save()                           # this merged cell is done on every sheet
         except Exception as e:
@@ -1649,6 +1664,30 @@ def apply_merge_splits(file_bytes: bytes, groups: list):
                 row_hs[(g["sheet"], r)] = hs
             k += size
     return good_bytes, applied, skipped, row_hs
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def merge_split_preview(file_bytes: bytes, group_json: str):
+    """Dry run of auto split for ONE merged cell -> (DataFrame: one row per new merged cell per sheet, error text)."""
+    g = json.loads(group_json)
+    collect = []
+    _b, applied, skipped, _r = apply_merge_splits(file_bytes, [g], collect)
+    if skipped:
+        return pd.DataFrame(), skipped[0][1]
+    names = {"hs": "HS", "qty": "数量", "ctns": "箱数", "gw": "毛重 G.W.", "nw": "净重 N.W.", "cbm": "体积",
+             "total": "金额", "unit": "单价"}
+    parts = merge_split_groups(g)
+    rows = {}
+    for sheet, k, field, v in collect:
+        d = rows.setdefault((sheet, k), {"工作表": sheet, "新并格": k + 1,
+                                         "SKU": "、".join(f"{l['sku']}（{l.get('sku_qty', '')}）" for l in parts[k][1])})
+        d[names.get(field, field or "其它")] = v
+    order = {g["sheet"]: 0}
+    df = pd.DataFrame(sorted(rows.values(), key=lambda d: (order.get(d["工作表"], 1), d["工作表"], d["新并格"])))
+    cols = [c for c in ("工作表", "新并格", "HS", "SKU", "数量", "箱数", "毛重 G.W.", "净重 N.W.", "体积", "金额", "单价")
+            if c in df.columns] + [c for c in df.columns if c not in ("工作表", "新并格", "HS", "SKU", "数量", "箱数",
+                                                                       "毛重 G.W.", "净重 N.W.", "体积", "金额", "单价")]
+    return df[cols].astype(object).where(df[cols].notna(), ""), ""
 
 
 def apply_merge_splits_json(file_bytes: bytes, groups_json: str):
@@ -1697,7 +1736,7 @@ def render_check_cards(check_df: pd.DataFrame):
             render_cards(sub, color)
 
 
-def render_merge_form(conflict_groups: list, merge_msgs: dict):
+def render_merge_form(conflict_groups: list, merge_msgs: dict, file_bytes: dict = None):
     """Step 2 UI. Every merged HS cell has its own radio (+ a free-text HS box) and its own confirm button;
     a confirmed cell disappears from the list (it moves to the 'confirmed' list, where it can be undone).
     A second button confirms every cell that already has a choice in one go.
@@ -1725,7 +1764,7 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
         clicked, picks, customs = {}, {}, {}
         _labels_of = {gkey(g): {merge_option_label(hs, n, duty, g["pl_hs"]): hs for hs, n, duty in g["options"]} for g in pending}
         with st.form("merge_hs_form"):
-            with st.container(height=min(560, 480 * len(pending))):      # scroll window; the buttons stay in reach
+            with st.container(height=min(720, 660 * len(pending))):      # scroll window; the buttons stay in reach
                 for g in pending:
                     gi = conflict_groups.index(g) + 1
                     with st.container(border=True):
@@ -1734,12 +1773,22 @@ def render_merge_form(conflict_groups: list, merge_msgs: dict):
                         st.dataframe(pd.DataFrame({
                             "Excel 行":       [l["row"] for l in g["lines"]],
                             "SKU":            [l["sku"] for l in g["lines"]],
+                            "该 SKU 数量":     [l.get("sku_qty", "") for l in g["lines"]],
                             "箱单描述":        [l["desc"] for l in g["lines"]],
                             "箱单 HS (当前)":  [l["pl_hs"] for l in g["lines"]],
                             "参照库 HS":       [l["ref_hs"] for l in g["lines"]],
                             "参照税率":        [l["ref_duty"] for l in g["lines"]],
                             "对比":            [l["state"] for l in g["lines"]],
                         }), hide_index=True, use_container_width=True)
+                        if file_bytes and g["file"] in file_bytes:
+                            _pv, _err = merge_split_preview(
+                                file_bytes[g["file"]],
+                                json.dumps({k: g[k] for k in ("gid", "file", "sheet", "cell", "pl_hs", "lines")}, default=str))
+                            if _err:
+                                st.caption(f"⚠️ 这个并格不能自动分格：{_err}")
+                            else:
+                                st.caption("如果选「自动分格」，拆完后是这样（括号里是每个 SKU 的数量；金额、重量按数量比例拆）：")
+                                st.dataframe(_pv, hide_index=True, use_container_width=True)
                         picks[gkey(g)] = st.radio(
                             "这个并格的 HS 怎么处理？",
                             [merge_split_label(g)] + list(_labels_of[gkey(g)]) + [MERGE_CUSTOM_LABEL, MERGE_KEEP_LABEL],
@@ -2742,7 +2791,7 @@ def main():
                         merge_pick, merge_ready = {}, True
                         if conflict_groups:
                             with merge_slot:                 # right under the uploader
-                                merge_pick, merge_ready = render_merge_form(conflict_groups, merge_msgs)
+                                merge_pick, merge_ready = render_merge_form(conflict_groups, merge_msgs, file_bytes)
 
                         # ── RESULTS (top): report 1 counts ──
                         with result_slot:
